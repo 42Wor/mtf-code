@@ -1,0 +1,11 @@
+[package]
+name = "mtf-compiler"
+version = "1.0.0"
+edition = "2021"
+authors = ["Maaz <MZTensor Labs>"]
+
+[dependencies]
+mtf-common = { path = "../mtf-common" }
+byteorder = "1.5"
+safetensors = "0.4.1"
+memmap2 = "0.9.3"

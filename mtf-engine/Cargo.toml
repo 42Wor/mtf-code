@@ -1,0 +1,9 @@
+[package]
+name = "mtf-engine"
+version = "1.0.0"
+edition = "2021"
+authors = ["Maaz <MZTensor Labs>"]
+
+[dependencies]
+mtf-common = { path = "../mtf-common" }
+memmap2 = "0.9.3"

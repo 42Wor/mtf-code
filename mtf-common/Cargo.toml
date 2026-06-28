@@ -1,0 +1,8 @@
+[package]
+name = "mtf-common"
+version = "1.0.0"
+edition = "2021"
+authors = ["Maaz <MZTensor Labs>"]
+
+[dependencies]
+byteorder = "1.5"
