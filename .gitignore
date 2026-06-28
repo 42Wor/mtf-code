@@ -1,0 +1,21 @@
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Python artifacts
+__pycache__/
+*.pyc
+.env
+venv/
+
+# Massive Model Weights and Configs
+test_models/
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Compiled MTF binaries
+*.mtf
+*.mzt
