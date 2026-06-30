@@ -6,4 +6,7 @@ authors = ["Maaz <MZTensor Labs>"]
 
 [dependencies]
 mtf-common = { path = "../mtf-common" }
-memmap2 = "0.9.3"
+memmap2 = "0.9.11"
+zstd = "0.13"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
