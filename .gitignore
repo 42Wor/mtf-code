@@ -45,3 +45,5 @@ rustc-ice-*.txt
 #.idea/
 prompt.txt
 make_prompt.py
+test_models/
+target/
