@@ -1,12 +1,12 @@
 use memmap2::Mmap;
 use mtf_common::hash::mtf_hash_name;
 use mtf_common::{MAGIC_BYTES, MAGIC_FOOTER};
-use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{stdin, stdout, Read, Write};
 use std::path::Path;
 use std::time::Instant;
+use tokenizers::Tokenizer; // <-- real BPE tokenizer
 
 #[derive(Debug)]
 pub enum MtfError {
@@ -129,7 +129,6 @@ impl MtfModel {
         })
     }
 
-    /// Returns the raw byte slice AND the quantization type (0 = F32, 1 = F16)
     pub fn get_tensor(&self, name_hash: u64) -> Result<(&[u8], u8)> {
         match self
             .tensors
@@ -167,7 +166,6 @@ impl MtfModel {
         &self.metadata_json
     }
 
-    // Restored the missing method!
     pub fn tensors(&self) -> &[MtfTensorInfo] {
         &self.tensors
     }
@@ -198,10 +196,8 @@ fn decode_f16(bytes: [u8; 2]) -> f32 {
     }
 }
 
-// Dynamically decodes F32 or F16 based on the tensor's quant_type
 fn decode_weight_matrix(payload: &[u8], quant_type: u8) -> Vec<f32> {
     if quant_type == 0 {
-        // F32 Decoding (4 bytes per float)
         let size = payload.len() / 4;
         let mut matrix = vec![0.0f32; size];
         for i in 0..size {
@@ -215,7 +211,6 @@ fn decode_weight_matrix(payload: &[u8], quant_type: u8) -> Vec<f32> {
         }
         matrix
     } else {
-        // F16 Decoding (2 bytes per float)
         let size = payload.len() / 2;
         let mut matrix = vec![0.0f32; size];
         for i in 0..size {
@@ -380,77 +375,36 @@ fn apply_swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
+// ============================================================
+//  DynamicTokenizer using the 'tokenizers' crate
+// ============================================================
 struct DynamicTokenizer {
-    vocab_to_id: HashMap<String, u32>,
-    id_to_vocab: HashMap<u32, String>,
+    tokenizer: Tokenizer,
 }
 
 impl DynamicTokenizer {
     fn new(metadata_json: &str) -> Self {
-        let mut vocab_to_id = HashMap::new();
-        let mut id_to_vocab = HashMap::new();
-
-        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(metadata_json) {
-            if let Some(vocab) = meta
-                .pointer("/tokenizer/model/vocab")
-                .and_then(|v| v.as_object())
-            {
-                for (token, id_val) in vocab {
-                    if let Some(id) = id_val.as_u64() {
-                        vocab_to_id.insert(token.clone(), id as u32);
-                        id_to_vocab.insert(id as u32, token.clone());
-                    }
-                }
-            }
-        }
-
-        Self {
-            vocab_to_id,
-            id_to_vocab,
-        }
+        let meta: serde_json::Value =
+            serde_json::from_str(metadata_json).expect("Failed to parse metadata JSON");
+        let tokenizer_json = meta["tokenizer"].to_string();
+        let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes())
+            .expect("Failed to load tokenizer from metadata");
+        Self { tokenizer }
     }
 
     fn tokenize(&self, text: &str) -> Vec<u32> {
-        let mut tokens = Vec::new();
-        let words: Vec<&str> = text.split_whitespace().collect();
-
-        for word in words {
-            let cand1 = word.to_string();
-            let cand2 = format!(" {}", word);
-            let cand3 = format!("Ġ{}", word);
-
-            let mut found = false;
-            for cand in &[&cand2, &cand3, &cand1] {
-                if let Some(&id) = self.vocab_to_id.get(*cand) {
-                    tokens.push(id);
-                    found = true;
-                    break;
-                }
-            }
-
-            if !found {
-                for c in word.chars() {
-                    let s = c.to_string();
-                    if let Some(&id) = self.vocab_to_id.get(&s) {
-                        tokens.push(id);
-                    } else {
-                        tokens.push(220); // Safe fallback space token
-                    }
-                }
-            }
-        }
-        tokens
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .expect("Tokenization failed");
+        encoding.get_ids().to_vec()
     }
 
     fn decode_token(&self, id: u32) -> String {
-        if let Some(token) = self.id_to_vocab.get(&id) {
-            token
-                .replace("Ġ", " ")
-                .replace("Ċ", "\n")
-                .replace("<|im_end|>", "\n")
-        } else {
-            format!("<unk:{}>", id)
-        }
+        self.tokenizer
+            .id_to_token(id)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("<unk:{}>", id))
     }
 }
 
@@ -599,6 +553,20 @@ fn main() -> Result<()> {
     let final_norm_weight = decode_weight_matrix(norm_payload, norm_qtype);
 
     let embed_tokens_f32 = decode_weight_matrix(embed_payload, embed_qtype);
+
+    // ============================================================
+    //  lm_head – fallback to tied embeddings if missing
+    // ============================================================
+    let lm_head_f32 = match model.get_tensor(mtf_hash_name("lm_head.weight")) {
+        Ok((payload, qtype)) => {
+            println!("[+] Loaded separate lm_head.weight");
+            decode_weight_matrix(payload, qtype)
+        }
+        Err(_) => {
+            println!("[WARN] lm_head.weight not found; using tied embeddings (embed_tokens) as output projection.");
+            embed_tokens_f32.clone()
+        }
+    };
 
     println!(
         "[SUCCESS] Pre-decoded dynamic Model layers in {:?}",
@@ -784,16 +752,18 @@ fn main() -> Result<()> {
             let mut final_norm = vec![0.0f32; hidden_size];
             rms_norm(last_hidden, &final_norm_weight, &mut final_norm, 1e-6);
 
+            // ============================================================
+            // Use lm_head (or tied embeddings) for logits
+            // ============================================================
             let mut logits = vec![0.0f32; vocab_size];
             for vocab_id in 0..vocab_size {
                 let start = vocab_id * hidden_size;
                 let end = start + hidden_size;
-                if end > embed_tokens_f32.len() {
+                if end > lm_head_f32.len() {
                     continue;
                 }
-
-                let vocab_vec = &embed_tokens_f32[start..end];
-                logits[vocab_id] = vocab_vec
+                let lm_row = &lm_head_f32[start..end];
+                logits[vocab_id] = lm_row
                     .iter()
                     .zip(final_norm.iter())
                     .map(|(w, x)| w * x)
