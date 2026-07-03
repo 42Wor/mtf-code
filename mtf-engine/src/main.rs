@@ -183,7 +183,11 @@ fn decode_f16(bytes: [u8; 2]) -> f32 {
         sign_f * (mant as f32) * 2.0f32.powi(-24)
     } else if exp == 31 {
         if mant == 0 {
-            if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
+            if sign == 1 {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            }
         } else {
             f32::NAN
         }
@@ -379,8 +383,8 @@ struct DynamicTokenizer {
 
 impl DynamicTokenizer {
     fn new(metadata_json: &str) -> Self {
-        let meta: serde_json::Value = serde_json::from_str(metadata_json)
-            .expect("Failed to parse metadata JSON");
+        let meta: serde_json::Value =
+            serde_json::from_str(metadata_json).expect("Failed to parse metadata JSON");
         let tokenizer_json = meta["tokenizer"].to_string();
         let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes())
             .expect("Failed to load tokenizer from metadata");
@@ -388,13 +392,16 @@ impl DynamicTokenizer {
     }
 
     fn tokenize(&self, text: &str) -> Vec<u32> {
-        let encoding = self.tokenizer.encode(text, true)
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
             .expect("Tokenization failed");
         encoding.get_ids().to_vec()
     }
 
     fn decode_token(&self, id: u32) -> String {
-        self.tokenizer.id_to_token(id)
+        self.tokenizer
+            .id_to_token(id)
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("<unk:{}>", id))
     }
@@ -442,7 +449,11 @@ fn main() -> Result<()> {
     let head_dim = 64;
     let n_q_heads = hidden_size / head_dim;
     let n_kv_heads = kv_proj_size / head_dim;
-    let group_size = if n_kv_heads > 0 { n_q_heads / n_kv_heads } else { 1 };
+    let group_size = if n_kv_heads > 0 {
+        n_q_heads / n_kv_heads
+    } else {
+        1
+    };
 
     let mut num_layers = 0;
     while model
@@ -565,17 +576,24 @@ fn main() -> Result<()> {
     let tokenizer = DynamicTokenizer::new(model.get_metadata());
 
     // ---- Get BOS and EOS from config ----
-    let config: serde_json::Value = serde_json::from_str(model.get_metadata())
-        .expect("Failed to parse metadata JSON");
+    let config: serde_json::Value =
+        serde_json::from_str(model.get_metadata()).expect("Failed to parse metadata JSON");
     let bos_token_id = config["config"]["bos_token_id"].as_u64().unwrap_or(151643) as u32;
     let eos_token_id = config["config"]["eos_token_id"].as_u64().unwrap_or(151643) as u32;
 
     // ---- Test tokenizer ----
     let test_text = "hi";
     let test_tokens = tokenizer.tokenize(test_text);
-    println!("[DEBUG] Tokenization of '{}' -> {:?}", test_text, test_tokens);
+    println!(
+        "[DEBUG] Tokenization of '{}' -> {:?}",
+        test_text, test_tokens
+    );
     for &id in &test_tokens {
-        println!("[DEBUG]   {} -> '{}'", id, tokenizer.decode_token(id));
+        println!(
+            "[DEBUG]   {} -> '{}'",
+            id,
+            tokenizer.decode_token(id).replace('Ġ', " ")
+        );
     }
 
     loop {
@@ -757,23 +775,33 @@ fn main() -> Result<()> {
             for vocab_id in 0..vocab_size {
                 let start = vocab_id * hidden_size;
                 let end = start + hidden_size;
-                if end > lm_head_f32.len() { continue; }
+                if end > lm_head_f32.len() {
+                    continue;
+                }
                 let lm_row = &lm_head_f32[start..end];
-                logits[vocab_id] = lm_row.iter().zip(final_norm.iter()).map(|(w, x)| w * x).sum();
+                logits[vocab_id] = lm_row
+                    .iter()
+                    .zip(final_norm.iter())
+                    .map(|(w, x)| w * x)
+                    .sum();
             }
 
             // Repetition penalty
             let penalty = 1.1;
             for &token_id in &gen_tokens {
                 let idx = token_id as usize;
-                if logits[idx] > 0.0 { logits[idx] /= penalty; }
-                else { logits[idx] *= penalty; }
+                if logits[idx] > 0.0 {
+                    logits[idx] /= penalty;
+                } else {
+                    logits[idx] *= penalty;
+                }
             }
 
             // ---- Temperature sampling ----
             let mut rng = rand::thread_rng();
             let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            let exp_sum: f32 = logits.iter()
+            let exp_sum: f32 = logits
+                .iter()
                 .map(|&x| ((x - max_logit) / temperature).exp())
                 .sum();
             let mut probs = Vec::with_capacity(vocab_size);
@@ -783,7 +811,7 @@ fn main() -> Result<()> {
                 cumulative += p;
                 probs.push(cumulative);
             }
-            let sample: f32 = rand::Rng::gen(&mut rng);
+            let sample: f32 = rng.gen();
             let mut predicted_token_id = 0;
             for (i, &c) in probs.iter().enumerate() {
                 if sample <= c {
@@ -792,10 +820,12 @@ fn main() -> Result<()> {
                 }
             }
 
-            if predicted_token_id == eos_token_id { break; }
+            if predicted_token_id == eos_token_id {
+                break;
+            }
 
             gen_tokens.push(predicted_token_id);
-            let word = tokenizer.decode_token(predicted_token_id);
+            let word = tokenizer.decode_token(predicted_token_id).replace('Ġ', " ");
             print!("{}", word);
             stdout().flush()?;
         }
