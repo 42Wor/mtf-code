@@ -3,10 +3,9 @@ use mtf_common::hash::mtf_hash_name;
 use mtf_common::{ALIGNMENT_BOUNDARY, MAGIC_BYTES, MAGIC_FOOTER};
 use safetensors::SafeTensors;
 use std::fs::File;
-use std::io::{Read, Seek, Write};
+use std::io::{Seek, Write};
 use std::path::Path;
 
-/// Simple enum to manage either zero-copy borrowed slices or allocated transformed data buffers.
 enum TensorData<'a> {
     Borrowed(&'a [u8]),
     Owned(Vec<u8>),
@@ -21,7 +20,6 @@ impl<'a> TensorData<'a> {
     }
 }
 
-/// Helper structure for tracking and processing compilation payloads
 struct CompileTensor<'a> {
     hash: u64,
     #[allow(dead_code)]
@@ -32,7 +30,6 @@ struct CompileTensor<'a> {
     absolute_offset: u64,
 }
 
-/// IEEE-754 Single-Precision (32-bit) to Half-Precision (16-bit) Converter.
 fn f32_to_f16(f: f32) -> u16 {
     let bits = f.to_bits();
     let sign = (bits >> 16) & 0x8000;
@@ -43,29 +40,20 @@ fn f32_to_f16(f: f32) -> u16 {
         let m = if mant != 0 { 0x200 } else { 0 };
         return (sign | 0x7c00 | m) as u16;
     }
-
-    exp += 15; // bias to half
-
+    exp += 15;
     if exp >= 31 {
-        // Overflow to infinity
         return (sign | 0x7c00) as u16;
     }
-
     if exp <= 0 {
-        // Underflow
         if exp < -10 {
             return sign as u16;
         }
-        // Denormalize
         mant = (mant | 0x800000) >> (1 - exp);
         return (sign | (mant >> 13)) as u16;
     }
-
-    // Normal half representation
     (sign | ((exp as u32) << 10) | (mant >> 13)) as u16
 }
 
-/// Decodes an FP16 / BF16 byte layout into standard F32 format.
 fn decode_half(bytes: [u8; 2], is_bf16: bool) -> f32 {
     if is_bf16 {
         let u = u16::from_le_bytes(bytes);
@@ -113,9 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if input_path.is_empty() {
-        println!(
-            "[-] Error: No source safetensors file found. Please ensure model.safetensors exists."
-        );
+        println!("[-] Error: No source safetensors file found.");
         std::process::exit(1);
     }
 
@@ -123,8 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let parent_dir = Path::new(input_path).parent().unwrap();
     let config_path = parent_dir.join("config.json");
+    let tokenizer_path = parent_dir.join("tokenizer.json");
 
-    // Load SafeTensors
     let in_file = File::open(input_path)?;
     let mmap = unsafe { memmap2::Mmap::map(&in_file)? };
     let st = SafeTensors::deserialize(&mmap)?;
@@ -142,28 +128,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => "Unknown",
         };
 
-        // Rule: Norms stay F32 (0) for high precision, other weights compress to F16 (1).
         let (target_type_str, data_type) = if name.contains("norm") {
             ("F32", 0)
         } else {
             ("F16", 1)
         };
 
-        // Convert the data if needed
         let converted_data = match (tensor.dtype(), data_type) {
             (safetensors::Dtype::F32, 1) => {
-                // Convert F32 -> F16
                 let elements = raw_data.len() / 4;
                 let mut converted = Vec::with_capacity(elements * 2);
                 for chunk in raw_data.chunks_exact(4) {
                     let val = f32::from_le_bytes(chunk.try_into().unwrap());
-                    let h = f32_to_f16(val);
-                    converted.extend_from_slice(&h.to_le_bytes());
+                    converted.extend_from_slice(&f32_to_f16(val).to_le_bytes());
                 }
                 TensorData::Owned(converted)
             }
             (safetensors::Dtype::F16, 0) | (safetensors::Dtype::BF16, 0) => {
-                // Convert F16/BF16 -> F32
                 let elements = raw_data.len() / 2;
                 let mut converted = Vec::with_capacity(elements * 4);
                 let is_bf16 = tensor.dtype() == safetensors::Dtype::BF16;
@@ -173,10 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 TensorData::Owned(converted)
             }
-            _ => {
-                // Keep as-is
-                TensorData::Borrowed(raw_data)
-            }
+            _ => TensorData::Borrowed(raw_data),
         };
 
         println!(
@@ -194,7 +172,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Sort by hash key for O(log N) binary search lookup
     tensors.sort_by_key(|t| t.hash);
     println!(
         "[+] Index built & sorted. Processing {} tensors...",
@@ -204,12 +181,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_path = "model.mtf";
     let mut out = File::create(output_path)?;
 
-    // 1. Write Header (64 bytes) - Versioning removed, replaced with padding
     out.write_all(MAGIC_BYTES)?;
     out.write_u64::<LittleEndian>(tensors.len() as u64)?;
-    out.write_all(&[0u8; 48])?; // 8 + 8 + 48 = 64 bytes
+    out.write_all(&[0u8; 48])?;
 
-    // 2. Write aligned payloads
     for t in &mut tensors {
         let current_pos = out.stream_position()?;
         let boundary_modulo = current_pos % ALIGNMENT_BOUNDARY;
@@ -217,12 +192,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let padding_needed = ALIGNMENT_BOUNDARY - boundary_modulo;
             out.write_all(&vec![0u8; padding_needed as usize])?;
         }
-
         t.absolute_offset = out.stream_position()?;
         out.write_all(t.raw_data.as_slice())?;
     }
 
-    // 3. Write Index segment
     let index_offset = out.stream_position()?;
     for t in &tensors {
         out.write_u64::<LittleEndian>(t.hash)?;
@@ -234,23 +207,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 4. Read config or use fallback JSON, compress with Zstd Level 3
-    let mut metadata_str = String::new();
+    let mut metadata = serde_json::json!({});
+
     if config_path.exists() {
-        println!("[+] Found config.json at: {}", config_path.display());
-        let mut file = File::open(config_path)?;
-        file.read_to_string(&mut metadata_str)?;
-    } else {
-        println!("[-] No config.json found. Creating generic fallback metadata.");
-        metadata_str = r#"{"model_type": "generic-transformer", "vocab_size": 32000}"#.to_string();
+        println!("[+] Embedding config.json...");
+        let config_str = std::fs::read_to_string(&config_path)?;
+        if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+            metadata["config"] = config_json;
+        }
     }
 
+    if tokenizer_path.exists() {
+        println!("[+] Embedding tokenizer.json...");
+        let tok_str = std::fs::read_to_string(&tokenizer_path)?;
+        if let Ok(tok_json) = serde_json::from_str::<serde_json::Value>(&tok_str) {
+            metadata["tokenizer"] = tok_json;
+        }
+    }
+
+    let metadata_str = metadata.to_string();
     let metadata_offset = out.stream_position()?;
     let compressed_meta = zstd::encode_all(metadata_str.as_bytes(), 3)?;
     let metadata_size = compressed_meta.len() as u64;
     out.write_all(&compressed_meta)?;
 
-    // 5. Write Footer (64 bytes)
     out.write_u64::<LittleEndian>(index_offset)?;
     out.write_u64::<LittleEndian>(metadata_offset)?;
     out.write_u64::<LittleEndian>(metadata_size)?;

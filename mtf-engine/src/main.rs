@@ -1,6 +1,7 @@
 use memmap2::Mmap;
 use mtf_common::hash::mtf_hash_name;
 use mtf_common::{MAGIC_BYTES, MAGIC_FOOTER};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{stdin, stdout, Read, Write};
@@ -55,29 +56,20 @@ impl MtfModel {
         let file_size = metadata.len();
 
         if file_size < 128 {
-            return Err(MtfError::InvalidFormat(
-                "File size too small for standard MTF headers".into(),
-            ));
+            return Err(MtfError::InvalidFormat("File size too small".into()));
         }
 
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // 1. Verify Header
         if &mmap[0..8] != MAGIC_BYTES {
-            return Err(MtfError::InvalidFormat(
-                "Corrupt or invalid physical header magic".into(),
-            ));
+            return Err(MtfError::InvalidFormat("Corrupt header magic".into()));
         }
 
-        // 2. Verify Footer
         let footer_start = (file_size - 64) as usize;
         if &mmap[footer_start + 56..footer_start + 64] != MAGIC_FOOTER {
-            return Err(MtfError::InvalidFormat(
-                "Footer structure magic validation failed".into(),
-            ));
+            return Err(MtfError::InvalidFormat("Corrupt footer magic".into()));
         }
 
-        // 3. Decode Trailing Offsets
         let index_offset =
             u64::from_le_bytes(mmap[footer_start..footer_start + 8].try_into().unwrap()) as usize;
         let metadata_offset = u64::from_le_bytes(
@@ -91,13 +83,11 @@ impl MtfModel {
                 .unwrap(),
         ) as usize;
 
-        // 4. Decompress Metadata Sandbox
         let compressed_meta = &mmap[metadata_offset..metadata_offset + metadata_size];
         let mut decoder = zstd::Decoder::new(compressed_meta)?;
         let mut metadata_json = String::new();
         decoder.read_to_string(&mut metadata_json)?;
 
-        // 5. Decode Index Segment
         let mut tensors = Vec::new();
         let index_bytes = &mmap[index_offset..metadata_offset];
         let mut cursor = 0;
@@ -114,9 +104,7 @@ impl MtfModel {
             cursor += 18;
 
             if cursor + (n_dims * 4) > index_bytes.len() {
-                return Err(MtfError::InvalidFormat(
-                    "Corrupted dimension metadata in index segment".into(),
-                ));
+                return Err(MtfError::InvalidFormat("Corrupted dimensions".into()));
             }
 
             let mut shape = Vec::with_capacity(n_dims);
@@ -141,8 +129,8 @@ impl MtfModel {
         })
     }
 
-    /// Retrieves the exact, unpadded slice belonging to the requested tensor.
-    pub fn get_tensor_payload(&self, name_hash: u64) -> Result<&[u8]> {
+    /// Returns the raw byte slice AND the quantization type (0 = F32, 1 = F16)
+    pub fn get_tensor(&self, name_hash: u64) -> Result<(&[u8], u8)> {
         match self
             .tensors
             .binary_search_by_key(&name_hash, |t| t.name_hash)
@@ -150,27 +138,26 @@ impl MtfModel {
             Ok(idx) => {
                 let tensor = &self.tensors[idx];
                 let start_offset = tensor.offset as usize;
-
-                // Calculate precise byte length of the actual payload
                 let num_elements: usize = tensor.shape.iter().map(|&d| d as usize).product();
                 let element_size = match tensor.quant_type {
-                    0 => 4, // F32
-                    1 => 2, // F16 / BF16
-                    _ => 2, // Default fallback
+                    0 => 4,
+                    1 => 2,
+                    _ => 2,
                 };
                 let exact_size = num_elements * element_size;
 
                 if start_offset + exact_size > self.mmap.len() {
-                    return Err(MtfError::InvalidFormat(format!(
-                        "Tensor hash {:x} payload boundary exceeds physical file limits",
-                        name_hash
-                    )));
+                    return Err(MtfError::InvalidFormat(
+                        "Payload exceeds file limits".into(),
+                    ));
                 }
-
-                Ok(&self.mmap[start_offset..start_offset + exact_size])
+                Ok((
+                    &self.mmap[start_offset..start_offset + exact_size],
+                    tensor.quant_type,
+                ))
             }
             Err(_) => Err(MtfError::TensorNotFound(format!(
-                "Hash key {:x} not present in binary index",
+                "Hash {:x} not found",
                 name_hash
             ))),
         }
@@ -180,58 +167,74 @@ impl MtfModel {
         &self.metadata_json
     }
 
+    // Restored the missing method!
     pub fn tensors(&self) -> &[MtfTensorInfo] {
         &self.tensors
     }
 }
 
-// 16-bit half-precision decoding helper
-fn decode_half(bytes: [u8; 2], is_bf16: bool) -> f32 {
-    if is_bf16 {
-        let u = u16::from_le_bytes(bytes);
-        f32::from_bits((u as u32) << 16)
-    } else {
-        let h = u16::from_le_bytes(bytes);
-        let sign = (h >> 15) & 1;
-        let exp = (h >> 10) & 0x1f;
-        let mant = h & 0x3ff;
-        if exp == 0 {
-            let sign_f = if sign == 1 { -1.0 } else { 1.0 };
-            sign_f * (mant as f32) * 2.0f32.powi(-24)
-        } else if exp == 31 {
-            if mant == 0 {
-                if sign == 1 {
-                    f32::NEG_INFINITY
-                } else {
-                    f32::INFINITY
-                }
+// Standard IEEE-754 F16 Decoder
+fn decode_f16(bytes: [u8; 2]) -> f32 {
+    let h = u16::from_le_bytes(bytes);
+    let sign = (h >> 15) & 1;
+    let exp = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    if exp == 0 {
+        let sign_f = if sign == 1 { -1.0 } else { 1.0 };
+        sign_f * (mant as f32) * 2.0f32.powi(-24)
+    } else if exp == 31 {
+        if mant == 0 {
+            if sign == 1 {
+                f32::NEG_INFINITY
             } else {
-                f32::NAN
+                f32::INFINITY
             }
         } else {
-            let sign_f = if sign == 1 { -1.0 } else { 1.0 };
-            sign_f * (1.0 + (mant as f32) / 1024.0) * 2.0f32.powi(exp as i32 - 15)
+            f32::NAN
         }
+    } else {
+        let sign_f = if sign == 1 { -1.0 } else { 1.0 };
+        sign_f * (1.0 + (mant as f32) / 1024.0) * 2.0f32.powi(exp as i32 - 15)
     }
 }
 
-fn decode_weight_matrix(payload: &[u8], is_bf16: bool) -> Vec<f32> {
-    let size = payload.len() / 2;
-    let mut matrix = vec![0.0f32; size];
-    for i in 0..size {
-        let b0 = payload[i * 2];
-        let b1 = payload[i * 2 + 1];
-        matrix[i] = decode_half([b0, b1], is_bf16);
+// Dynamically decodes F32 or F16 based on the tensor's quant_type
+fn decode_weight_matrix(payload: &[u8], quant_type: u8) -> Vec<f32> {
+    if quant_type == 0 {
+        // F32 Decoding (4 bytes per float)
+        let size = payload.len() / 4;
+        let mut matrix = vec![0.0f32; size];
+        for i in 0..size {
+            let chunk = [
+                payload[i * 4],
+                payload[i * 4 + 1],
+                payload[i * 4 + 2],
+                payload[i * 4 + 3],
+            ];
+            matrix[i] = f32::from_le_bytes(chunk);
+        }
+        matrix
+    } else {
+        // F16 Decoding (2 bytes per float)
+        let size = payload.len() / 2;
+        let mut matrix = vec![0.0f32; size];
+        for i in 0..size {
+            let b0 = payload[i * 2];
+            let b1 = payload[i * 2 + 1];
+            matrix[i] = decode_f16([b0, b1]);
+        }
+        matrix
     }
-    matrix
 }
 
-// Representation of a dynamic block layer
 struct ActiveLayer {
     input_layernorm: Vec<f32>,
     q_proj: Vec<f32>,
+    q_bias: Vec<f32>,
     k_proj: Vec<f32>,
+    k_bias: Vec<f32>,
     v_proj: Vec<f32>,
+    v_bias: Vec<f32>,
     o_proj: Vec<f32>,
     post_attention_layernorm: Vec<f32>,
     gate_proj: Vec<f32>,
@@ -239,18 +242,15 @@ struct ActiveLayer {
     down_proj: Vec<f32>,
 }
 
-// Optimized RMSNorm implementation (Auto-vectorized by LLVM)
 fn rms_norm(input: &[f32], weight: &[f32], out: &mut [f32], eps: f32) {
     let size = input.len();
     let sum: f32 = input.iter().map(|&x| x * x).sum();
     let rms = (sum / size as f32 + eps).sqrt();
-
     for (o, (&i, &w)) in out.iter_mut().zip(input.iter().zip(weight.iter())) {
         *o = (i / rms) * w;
     }
 }
 
-// Optimized Matrix-Vector Multiplication (Auto-vectorized by LLVM)
 fn matmul_vec(out: &mut [f32], weight: &[f32], vec: &[f32], rows: usize, cols: usize) {
     for (r, out_val) in out.iter_mut().enumerate().take(rows) {
         let row_offset = r * cols;
@@ -259,7 +259,26 @@ fn matmul_vec(out: &mut [f32], weight: &[f32], vec: &[f32], rows: usize, cols: u
     }
 }
 
-// Sinusoidal Rotary Position Embedding (RoPE)
+fn matmul_vec_bias(
+    out: &mut [f32],
+    weight: &[f32],
+    vec: &[f32],
+    bias: &[f32],
+    rows: usize,
+    cols: usize,
+) {
+    for (r, out_val) in out.iter_mut().enumerate().take(rows) {
+        let row_offset = r * cols;
+        let w_row = &weight[row_offset..row_offset + cols];
+        *out_val = w_row
+            .iter()
+            .zip(vec.iter())
+            .map(|(w, v)| w * v)
+            .sum::<f32>()
+            + bias[r];
+    }
+}
+
 fn apply_rope(
     q: &mut [f32],
     k: &mut [f32],
@@ -276,10 +295,8 @@ fn apply_rope(
             let angle = (pos as f32) * theta;
             let cos_val = angle.cos();
             let sin_val = angle.sin();
-
             let q_0 = q[offset + c];
             let q_1 = q[offset + c + half_dim];
-
             q[offset + c] = q_0 * cos_val - q_1 * sin_val;
             q[offset + c + half_dim] = q_0 * sin_val + q_1 * cos_val;
         }
@@ -291,17 +308,14 @@ fn apply_rope(
             let angle = (pos as f32) * theta;
             let cos_val = angle.cos();
             let sin_val = angle.sin();
-
             let k_0 = k[offset + c];
             let k_1 = k[offset + c + half_dim];
-
             k[offset + c] = k_0 * cos_val - k_1 * sin_val;
             k[offset + c + half_dim] = k_0 * sin_val + k_1 * cos_val;
         }
     }
 }
 
-// Dynamic Grouped Query Attention (GQA) with Causal Masking
 fn gqa_attention(
     q_seq: &[f32],
     k_seq: &[f32],
@@ -326,7 +340,6 @@ fn gqa_attention(
             for j in 0..=i {
                 let k_head_offset = j * kv_proj_size + kv_h * head_dim;
                 let k_slice = &k_seq[k_head_offset..k_head_offset + head_dim];
-
                 let mut dot = 0.0f32;
                 for k_idx in 0..head_dim {
                     dot += q_slice[k_idx] * k_slice[k_idx];
@@ -338,7 +351,6 @@ fn gqa_attention(
                 }
             }
 
-            // Softmax
             let mut sum_exp = 0.0f32;
             for j in 0..=i {
                 scores[j] = (scores[j] - max_score).exp();
@@ -348,7 +360,6 @@ fn gqa_attention(
                 scores[j] /= sum_exp;
             }
 
-            // Weighted sum over V
             let out_head_offset = i * hidden_size + h * head_dim;
             for k_idx in 0..head_dim {
                 let mut val = 0.0f32;
@@ -362,7 +373,6 @@ fn gqa_attention(
     }
 }
 
-// Optimized SwiGLU activation (Auto-vectorized by LLVM)
 fn apply_swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
     for ((&g, &u), o) in gate.iter().zip(up.iter()).zip(out.iter_mut()) {
         let sig = 1.0 / (1.0 + (-g).exp());
@@ -370,91 +380,77 @@ fn apply_swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
-// Vocab mapping dict for Qwen2
-struct SimpleTokenizer {
-    vocab: Vec<(&'static str, u32)>,
+struct DynamicTokenizer {
+    vocab_to_id: HashMap<String, u32>,
+    id_to_vocab: HashMap<u32, String>,
 }
 
-impl SimpleTokenizer {
-    fn new() -> Self {
+impl DynamicTokenizer {
+    fn new(metadata_json: &str) -> Self {
+        let mut vocab_to_id = HashMap::new();
+        let mut id_to_vocab = HashMap::new();
+
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(metadata_json) {
+            if let Some(vocab) = meta
+                .pointer("/tokenizer/model/vocab")
+                .and_then(|v| v.as_object())
+            {
+                for (token, id_val) in vocab {
+                    if let Some(id) = id_val.as_u64() {
+                        vocab_to_id.insert(token.clone(), id as u32);
+                        id_to_vocab.insert(id as u32, token.clone());
+                    }
+                }
+            }
+        }
+
         Self {
-            vocab: vec![
-                ("hello", 15043),
-                ("world", 387),
-                ("i", 358),
-                ("am", 825),
-                ("the", 279),
-                ("maaz", 42331),
-                ("tensor", 31221),
-                ("format", 5521),
-                ("inference", 35431),
-                ("engine", 12341),
-                ("running", 6652),
-                ("on", 315),
-                ("pure", 14321),
-                ("rust", 21232),
-                ("with", 351),
-                ("strict", 18765),
-                ("alignment", 22123),
-                ("and", 290),
-                ("ultra-fast", 32112),
-                ("hardware", 9876),
-                ("is", 374),
-                ("fully", 6543),
-                ("optimized", 11223),
-                ("today", 4321),
-                ("deep", 12345),
-                ("learning", 5432),
-                ("workloads", 31234),
-                ("computer", 8765),
-                ("system", 2341),
-                ("cpu", 11211),
-                ("performs", 14322),
-                ("actual", 8762),
-                ("math", 18721),
-                ("operations", 9872),
-                ("to", 311),
-                ("generate", 11212),
-                ("real", 3211),
-                ("tokens", 4322),
-                ("using", 1231),
-                ("weights", 9821),
-                ("from", 286),
-                ("file", 4323),
-                ("directly", 5431),
-                ("in", 275),
-                ("real-time", 32113),
-                ("how", 1232),
-                ("can", 432),
-                ("assist", 12111),
-                ("you", 372),
-            ],
+            vocab_to_id,
+            id_to_vocab,
         }
     }
 
     fn tokenize(&self, text: &str) -> Vec<u32> {
-        text.split_whitespace()
-            .map(|word| {
-                let cleaned = word
-                    .to_lowercase()
-                    .replace(",", "")
-                    .replace(".", "")
-                    .replace("?", "");
-                self.vocab
-                    .iter()
-                    .find(|&&(v, _)| v == cleaned)
-                    .map(|&(_, id)| id)
-                    .unwrap_or(279) // fallback to "the" token
-            })
-            .collect()
+        let mut tokens = Vec::new();
+        let words: Vec<&str> = text.split_whitespace().collect();
+
+        for word in words {
+            let cand1 = word.to_string();
+            let cand2 = format!(" {}", word);
+            let cand3 = format!("Ġ{}", word);
+
+            let mut found = false;
+            for cand in &[&cand2, &cand3, &cand1] {
+                if let Some(&id) = self.vocab_to_id.get(*cand) {
+                    tokens.push(id);
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                for c in word.chars() {
+                    let s = c.to_string();
+                    if let Some(&id) = self.vocab_to_id.get(&s) {
+                        tokens.push(id);
+                    } else {
+                        tokens.push(220); // Safe fallback space token
+                    }
+                }
+            }
+        }
+        tokens
     }
 
-    fn decode_token(&self, id: u32) -> &'static str {
-        self.vocab
-            .iter()
-            .find(|&&(_, vocab_id)| vocab_id == id)
-            .map(|&(v, _)| v)
-            .unwrap_or("the")
+    fn decode_token(&self, id: u32) -> String {
+        if let Some(token) = self.id_to_vocab.get(&id) {
+            token
+                .replace("Ġ", " ")
+                .replace("Ċ", "\n")
+                .replace("<|im_end|>", "\n")
+        } else {
+            format!("<unk:{}>", id)
+        }
     }
 }
 
@@ -470,19 +466,16 @@ fn main() -> Result<()> {
     }
 
     let model = MtfModel::load(model_path)?;
-    let is_bf16 = model.get_metadata().contains("bfloat16");
-    println!(
-        "[+] MTF Model loaded. Data Format: {}",
-        if is_bf16 { "BFloat16" } else { "FP16" }
-    );
+    println!("[+] MTF Model loaded successfully.");
 
-    // --- DYNAMIC PARAMETERS RESOLUTION ---
+    let (embed_payload, embed_qtype) = model
+        .get_tensor(mtf_hash_name("model.embed_tokens.weight"))
+        .unwrap();
     let embed_info = model
         .tensors()
         .iter()
         .find(|t| t.name_hash == mtf_hash_name("model.embed_tokens.weight"))
-        .expect("Could not resolve embedding matrix shape in compiled model");
-
+        .unwrap();
     let vocab_size = embed_info.shape[0] as usize;
     let hidden_size = embed_info.shape[1] as usize;
 
@@ -490,14 +483,14 @@ fn main() -> Result<()> {
         .tensors()
         .iter()
         .find(|t| t.name_hash == mtf_hash_name("model.layers.0.mlp.gate_proj.weight"))
-        .expect("Could not resolve gate projection shape in compiled model");
+        .unwrap();
     let intermediate_size = gate_proj_info.shape[0] as usize;
 
     let k_proj_info = model
         .tensors()
         .iter()
         .find(|t| t.name_hash == mtf_hash_name("model.layers.0.self_attn.k_proj.weight"))
-        .expect("Could not resolve attention projection shape in compiled model");
+        .unwrap();
     let kv_proj_size = k_proj_info.shape[0] as usize;
 
     let head_dim = 64;
@@ -509,10 +502,9 @@ fn main() -> Result<()> {
         1
     };
 
-    // Dynamically query available layers in the binary structure
     let mut num_layers = 0;
     while model
-        .get_tensor_payload(mtf_hash_name(&format!(
+        .get_tensor(mtf_hash_name(&format!(
             "model.layers.{}.input_layernorm.weight",
             num_layers
         )))
@@ -530,13 +522,6 @@ fn main() -> Result<()> {
     println!("    - GQA Group Size:       {}", group_size);
     println!("    - Layers Detected:      {}", num_layers);
 
-    if num_layers == 0 {
-        return Err(MtfError::InvalidFormat(
-            "No computational layers detected inside model.mtf".into(),
-        ));
-    }
-
-    // --- CPU DECODER & REGISTER INIT ---
     println!(
         "\n[*] Pre-decoding all {} block layers into CPU registers...",
         num_layers
@@ -545,92 +530,85 @@ fn main() -> Result<()> {
 
     let mut layers = Vec::with_capacity(num_layers);
     for l in 0..num_layers {
+        let (in_norm_p, in_norm_q) = model.get_tensor(mtf_hash_name(&format!(
+            "model.layers.{}.input_layernorm.weight",
+            l
+        )))?;
+        let (q_proj_p, q_proj_q) = model.get_tensor(mtf_hash_name(&format!(
+            "model.layers.{}.self_attn.q_proj.weight",
+            l
+        )))?;
+        let (q_bias_p, q_bias_q) = model.get_tensor(mtf_hash_name(&format!(
+            "model.layers.{}.self_attn.q_proj.bias",
+            l
+        )))?;
+        let (k_proj_p, k_proj_q) = model.get_tensor(mtf_hash_name(&format!(
+            "model.layers.{}.self_attn.k_proj.weight",
+            l
+        )))?;
+        let (k_bias_p, k_bias_q) = model.get_tensor(mtf_hash_name(&format!(
+            "model.layers.{}.self_attn.k_proj.bias",
+            l
+        )))?;
+        let (v_proj_p, v_proj_q) = model.get_tensor(mtf_hash_name(&format!(
+            "model.layers.{}.self_attn.v_proj.weight",
+            l
+        )))?;
+        let (v_bias_p, v_bias_q) = model.get_tensor(mtf_hash_name(&format!(
+            "model.layers.{}.self_attn.v_proj.bias",
+            l
+        )))?;
+        let (o_proj_p, o_proj_q) = model.get_tensor(mtf_hash_name(&format!(
+            "model.layers.{}.self_attn.o_proj.weight",
+            l
+        )))?;
+        let (post_norm_p, post_norm_q) = model.get_tensor(mtf_hash_name(&format!(
+            "model.layers.{}.post_attention_layernorm.weight",
+            l
+        )))?;
+        let (gate_proj_p, gate_proj_q) = model.get_tensor(mtf_hash_name(&format!(
+            "model.layers.{}.mlp.gate_proj.weight",
+            l
+        )))?;
+        let (up_proj_p, up_proj_q) = model.get_tensor(mtf_hash_name(&format!(
+            "model.layers.{}.mlp.up_proj.weight",
+            l
+        )))?;
+        let (down_proj_p, down_proj_q) = model.get_tensor(mtf_hash_name(&format!(
+            "model.layers.{}.mlp.down_proj.weight",
+            l
+        )))?;
+
         layers.push(ActiveLayer {
-            input_layernorm: decode_weight_matrix(
-                model.get_tensor_payload(mtf_hash_name(&format!(
-                    "model.layers.{}.input_layernorm.weight",
-                    l
-                )))?,
-                is_bf16,
-            ),
-            q_proj: decode_weight_matrix(
-                model.get_tensor_payload(mtf_hash_name(&format!(
-                    "model.layers.{}.self_attn.q_proj.weight",
-                    l
-                )))?,
-                is_bf16,
-            ),
-            k_proj: decode_weight_matrix(
-                model.get_tensor_payload(mtf_hash_name(&format!(
-                    "model.layers.{}.self_attn.k_proj.weight",
-                    l
-                )))?,
-                is_bf16,
-            ),
-            v_proj: decode_weight_matrix(
-                model.get_tensor_payload(mtf_hash_name(&format!(
-                    "model.layers.{}.self_attn.v_proj.weight",
-                    l
-                )))?,
-                is_bf16,
-            ),
-            o_proj: decode_weight_matrix(
-                model.get_tensor_payload(mtf_hash_name(&format!(
-                    "model.layers.{}.self_attn.o_proj.weight",
-                    l
-                )))?,
-                is_bf16,
-            ),
-            post_attention_layernorm: decode_weight_matrix(
-                model.get_tensor_payload(mtf_hash_name(&format!(
-                    "model.layers.{}.post_attention_layernorm.weight",
-                    l
-                )))?,
-                is_bf16,
-            ),
-            gate_proj: decode_weight_matrix(
-                model.get_tensor_payload(mtf_hash_name(&format!(
-                    "model.layers.{}.mlp.gate_proj.weight",
-                    l
-                )))?,
-                is_bf16,
-            ),
-            up_proj: decode_weight_matrix(
-                model.get_tensor_payload(mtf_hash_name(&format!(
-                    "model.layers.{}.mlp.up_proj.weight",
-                    l
-                )))?,
-                is_bf16,
-            ),
-            down_proj: decode_weight_matrix(
-                model.get_tensor_payload(mtf_hash_name(&format!(
-                    "model.layers.{}.mlp.down_proj.weight",
-                    l
-                )))?,
-                is_bf16,
-            ),
+            input_layernorm: decode_weight_matrix(in_norm_p, in_norm_q),
+            q_proj: decode_weight_matrix(q_proj_p, q_proj_q),
+            q_bias: decode_weight_matrix(q_bias_p, q_bias_q),
+            k_proj: decode_weight_matrix(k_proj_p, k_proj_q),
+            k_bias: decode_weight_matrix(k_bias_p, k_bias_q),
+            v_proj: decode_weight_matrix(v_proj_p, v_proj_q),
+            v_bias: decode_weight_matrix(v_bias_p, v_bias_q),
+            o_proj: decode_weight_matrix(o_proj_p, o_proj_q),
+            post_attention_layernorm: decode_weight_matrix(post_norm_p, post_norm_q),
+            gate_proj: decode_weight_matrix(gate_proj_p, gate_proj_q),
+            up_proj: decode_weight_matrix(up_proj_p, up_proj_q),
+            down_proj: decode_weight_matrix(down_proj_p, down_proj_q),
         });
     }
 
-    let final_norm_weight = decode_weight_matrix(
-        model.get_tensor_payload(mtf_hash_name("model.norm.weight"))?,
-        is_bf16,
-    );
+    let (norm_payload, norm_qtype) = model.get_tensor(mtf_hash_name("model.norm.weight"))?;
+    let final_norm_weight = decode_weight_matrix(norm_payload, norm_qtype);
+
+    let embed_tokens_f32 = decode_weight_matrix(embed_payload, embed_qtype);
 
     println!(
         "[SUCCESS] Pre-decoded dynamic Model layers in {:?}",
         start_decode.elapsed()
     );
 
-    // --- INTERACTIVE TERM ---
     println!("\n[Launch] Launching True CPU Inference Terminal...");
     println!("-------------------------------------------------------");
-    println!("Type your message and press ENTER. The CPU will compute");
-    println!("the actual Transformer forward pass over the loaded weights.");
-    println!("-------------------------------------------------------");
 
-    let tokenizer = SimpleTokenizer::new();
-    let embed_payload = model.get_tensor_payload(mtf_hash_name("model.embed_tokens.weight"))?;
+    let tokenizer = DynamicTokenizer::new(model.get_metadata());
 
     loop {
         print!("\nUser ❯ ");
@@ -650,16 +628,13 @@ fn main() -> Result<()> {
         }
 
         let start_time = Instant::now();
-
-        // 1. Tokenize Input
         let mut gen_tokens = tokenizer.tokenize(prompt);
-        let prompt_len = gen_tokens.len();
 
-        if prompt_len == 0 {
-            println!("[-] Warning: Input contains no valid tokens.");
+        if gen_tokens.is_empty() {
             continue;
         }
 
+        println!("[*] Tokenized prompt IDs: {:?}", gen_tokens);
         println!(
             "\n[CPU Math] Executing autoregressive text generation over {} layers...",
             num_layers
@@ -667,35 +642,26 @@ fn main() -> Result<()> {
         print!("Assistant ❯ ");
         stdout().flush()?;
 
-        // Generate 15 tokens sequentially in an autoregressive loop
-        let max_new_tokens = 15;
-        for step in 0..max_new_tokens {
+        let max_new_tokens = 25;
+        for _step in 0..max_new_tokens {
             let seq_len = gen_tokens.len();
-
-            // 2. Decode Token Embeddings on CPU
             let mut x_seq = vec![0.0f32; seq_len * hidden_size];
+
             for i in 0..seq_len {
-                let token_id = gen_tokens[i];
-                let offset = token_id as usize * (hidden_size * 2);
+                let token_id = gen_tokens[i] as usize;
+                let start = token_id * hidden_size;
+                let end = start + hidden_size;
 
-                let slice_offset = if offset + (hidden_size * 2) <= embed_payload.len() {
-                    offset
+                let slice = if end <= embed_tokens_f32.len() {
+                    &embed_tokens_f32[start..end]
                 } else {
-                    279 * (hidden_size * 2) // fallback token
+                    &embed_tokens_f32[0..hidden_size]
                 };
-
-                let token_slice = &embed_payload[slice_offset..slice_offset + (hidden_size * 2)];
-                for c in 0..hidden_size {
-                    let b0 = token_slice[c * 2];
-                    let b1 = token_slice[c * 2 + 1];
-                    x_seq[i * hidden_size + c] = decode_half([b0, b1], is_bf16);
-                }
+                x_seq[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(slice);
             }
 
-            // 3. Process activations sequentially through all detected layers
             for l in 0..num_layers {
                 let layer = &layers[l];
-
                 let mut x_norm = vec![0.0f32; hidden_size];
                 let mut q_seq = vec![0.0f32; seq_len * hidden_size];
                 let mut k_seq = vec![0.0f32; seq_len * kv_proj_size];
@@ -708,16 +674,35 @@ fn main() -> Result<()> {
                         &mut x_norm,
                         1e-6,
                     );
-
                     let mut q_i = vec![0.0f32; hidden_size];
                     let mut k_i = vec![0.0f32; kv_proj_size];
                     let mut v_i = vec![0.0f32; kv_proj_size];
 
-                    matmul_vec(&mut q_i, &layer.q_proj, &x_norm, hidden_size, hidden_size);
-                    matmul_vec(&mut k_i, &layer.k_proj, &x_norm, kv_proj_size, hidden_size);
-                    matmul_vec(&mut v_i, &layer.v_proj, &x_norm, kv_proj_size, hidden_size);
+                    matmul_vec_bias(
+                        &mut q_i,
+                        &layer.q_proj,
+                        &x_norm,
+                        &layer.q_bias,
+                        hidden_size,
+                        hidden_size,
+                    );
+                    matmul_vec_bias(
+                        &mut k_i,
+                        &layer.k_proj,
+                        &x_norm,
+                        &layer.k_bias,
+                        kv_proj_size,
+                        hidden_size,
+                    );
+                    matmul_vec_bias(
+                        &mut v_i,
+                        &layer.v_proj,
+                        &x_norm,
+                        &layer.v_bias,
+                        kv_proj_size,
+                        hidden_size,
+                    );
 
-                    // Apply sinusoidal Rotary Position Embedding (RoPE)
                     apply_rope(&mut q_i, &mut k_i, i, n_q_heads, n_kv_heads, head_dim);
 
                     q_seq[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(&q_i);
@@ -725,7 +710,6 @@ fn main() -> Result<()> {
                     v_seq[i * kv_proj_size..(i + 1) * kv_proj_size].copy_from_slice(&v_i);
                 }
 
-                // 4. GQA Attention calculation
                 let mut attn_out_seq = vec![0.0f32; seq_len * hidden_size];
                 gqa_attention(
                     &q_seq,
@@ -740,7 +724,6 @@ fn main() -> Result<()> {
                     head_dim,
                 );
 
-                // 5. Output Projection + Residual Add
                 let mut x_post_attn = vec![0.0f32; seq_len * hidden_size];
                 for i in 0..seq_len {
                     let mut o_i = vec![0.0f32; hidden_size];
@@ -756,7 +739,6 @@ fn main() -> Result<()> {
                     }
                 }
 
-                // 6. Post Attention norm + MLP SwiGLU pass
                 for i in 0..seq_len {
                     rms_norm(
                         &x_post_attn[i * hidden_size..(i + 1) * hidden_size],
@@ -764,7 +746,6 @@ fn main() -> Result<()> {
                         &mut x_norm,
                         1e-6,
                     );
-
                     let mut gate_i = vec![0.0f32; intermediate_size];
                     let mut up_i = vec![0.0f32; intermediate_size];
                     let mut swiglu_out = vec![0.0f32; intermediate_size];
@@ -799,53 +780,49 @@ fn main() -> Result<()> {
                 }
             }
 
-            // 7. Post Model Norm on the Last Sequence Activation Vector
             let last_hidden = &x_seq[(seq_len - 1) * hidden_size..seq_len * hidden_size];
             let mut final_norm = vec![0.0f32; hidden_size];
             rms_norm(last_hidden, &final_norm_weight, &mut final_norm, 1e-6);
 
-            // 8. Output vocabulary projection: logit multiplication over vocab list
-            let mut max_logit = f32::NEG_INFINITY;
-            let mut predicted_token_id = 279; // default fallback
+            let mut logits = vec![0.0f32; vocab_size];
+            for vocab_id in 0..vocab_size {
+                let start = vocab_id * hidden_size;
+                let end = start + hidden_size;
+                if end > embed_tokens_f32.len() {
+                    continue;
+                }
 
-            for &(_, vocab_id) in &tokenizer.vocab {
-                let offset = vocab_id as usize * (hidden_size * 2);
+                let vocab_vec = &embed_tokens_f32[start..end];
+                logits[vocab_id] = vocab_vec
+                    .iter()
+                    .zip(final_norm.iter())
+                    .map(|(w, x)| w * x)
+                    .sum();
+            }
 
-                let slice_offset = if offset + (hidden_size * 2) <= embed_payload.len() {
-                    offset
+            // Repetition Penalty
+            let penalty = 1.1f32;
+            for &token_id in &gen_tokens {
+                let idx = token_id as usize;
+                if logits[idx] > 0.0 {
+                    logits[idx] /= penalty;
                 } else {
-                    279 * (hidden_size * 2) // fallback
-                };
-
-                let token_slice = &embed_payload[slice_offset..slice_offset + (hidden_size * 2)];
-                let mut vocab_vec = vec![0.0f32; hidden_size];
-                for c in 0..hidden_size {
-                    let b0 = token_slice[c * 2];
-                    let b1 = token_slice[c * 2 + 1];
-                    vocab_vec[c] = decode_half([b0, b1], is_bf16);
-                }
-
-                // Dot Product projection for vocab logit
-                let mut logit = 0.0f32;
-                for c in 0..hidden_size {
-                    logit += vocab_vec[c] * final_norm[c];
-                }
-
-                if logit > max_logit {
-                    max_logit = logit;
-                    predicted_token_id = vocab_id;
+                    logits[idx] *= penalty;
                 }
             }
 
-            // Append predicted token for autoregressive loop
-            gen_tokens.push(predicted_token_id);
+            let mut max_logit = f32::NEG_INFINITY;
+            let mut predicted_token_id = 0;
+            for (i, &l) in logits.iter().enumerate() {
+                if l > max_logit {
+                    max_logit = l;
+                    predicted_token_id = i as u32;
+                }
+            }
 
-            // Stream-print the predicted token
+            gen_tokens.push(predicted_token_id);
             let word = tokenizer.decode_token(predicted_token_id);
             print!("{}", word);
-            if step < max_new_tokens - 1 {
-                print!(" ");
-            }
             stdout().flush()?;
         }
 
