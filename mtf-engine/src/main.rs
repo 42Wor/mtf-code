@@ -226,8 +226,8 @@ fn decode_weight_matrix(payload: &[u8], is_bf16: bool) -> Vec<f32> {
     matrix
 }
 
-// Real mathematical structures loaded into CPU registers
-struct ActiveLayer0 {
+// Representation of a dynamic block layer
+struct ActiveLayer {
     input_layernorm: Vec<f32>,
     q_proj: Vec<f32>,
     k_proj: Vec<f32>,
@@ -237,10 +237,9 @@ struct ActiveLayer0 {
     gate_proj: Vec<f32>,
     up_proj: Vec<f32>,
     down_proj: Vec<f32>,
-    norm: Vec<f32>,
 }
 
-// RMSNorm implementation: root mean square layernorm
+// RMSNorm implementation
 fn rms_norm(input: &[f32], weight: &[f32], out: &mut [f32], eps: f32) {
     let size = input.len();
     let mut sum = 0.0f32;
@@ -307,7 +306,7 @@ fn apply_rope(
     }
 }
 
-// Dynamic Grouped Query Attention (GQA) with Causal Masking
+// Grouped Query Attention (GQA) with Causal Masking
 fn GQA_attention(
     q_seq: &[f32],
     k_seq: &[f32],
@@ -516,6 +515,18 @@ fn main() -> Result<()> {
         1
     };
 
+    // Dynamically query available layers in the binary structure
+    let mut num_layers = 0;
+    while model
+        .get_tensor_payload(mtf_hash_name(&format!(
+            "model.layers.{}.input_layernorm.weight",
+            num_layers
+        )))
+        .is_ok()
+    {
+        num_layers += 1;
+    }
+
     println!("[+] Dynamic Model Architecture Resolved:");
     println!("    - Vocabulary Size:      {}", vocab_size);
     println!("    - Hidden Dimension:     {}", hidden_size);
@@ -523,58 +534,97 @@ fn main() -> Result<()> {
     println!("    - Attention Heads (Q):  {}", n_q_heads);
     println!("    - Attention Heads (KV): {}", n_kv_heads);
     println!("    - GQA Group Size:       {}", group_size);
+    println!("    - Layers Detected:      {}", num_layers);
+
+    if num_layers == 0 {
+        return Err(MtfError::InvalidFormat(
+            "No computational layers detected inside model.mtf".into(),
+        ));
+    }
 
     // --- CPU DECODER & REGISTER INIT ---
-    println!("\n[*] Pre-decoding Layer 0 weights into CPU float registers...");
+    println!(
+        "\n[*] Pre-decoding all {} block layers into CPU registers...",
+        num_layers
+    );
     let start_decode = Instant::now();
 
-    let layer0 = ActiveLayer0 {
-        input_layernorm: decode_weight_matrix(
-            model.get_tensor_payload(mtf_hash_name("model.layers.0.input_layernorm.weight"))?,
-            is_bf16,
-        ),
-        q_proj: decode_weight_matrix(
-            model.get_tensor_payload(mtf_hash_name("model.layers.0.self_attn.q_proj.weight"))?,
-            is_bf16,
-        ),
-        k_proj: decode_weight_matrix(
-            model.get_tensor_payload(mtf_hash_name("model.layers.0.self_attn.k_proj.weight"))?,
-            is_bf16,
-        ),
-        v_proj: decode_weight_matrix(
-            model.get_tensor_payload(mtf_hash_name("model.layers.0.self_attn.v_proj.weight"))?,
-            is_bf16,
-        ),
-        o_proj: decode_weight_matrix(
-            model.get_tensor_payload(mtf_hash_name("model.layers.0.self_attn.o_proj.weight"))?,
-            is_bf16,
-        ),
-        post_attention_layernorm: decode_weight_matrix(
-            model.get_tensor_payload(mtf_hash_name(
-                "model.layers.0.post_attention_layernorm.weight",
-            ))?,
-            is_bf16,
-        ),
-        gate_proj: decode_weight_matrix(
-            model.get_tensor_payload(mtf_hash_name("model.layers.0.mlp.gate_proj.weight"))?,
-            is_bf16,
-        ),
-        up_proj: decode_weight_matrix(
-            model.get_tensor_payload(mtf_hash_name("model.layers.0.mlp.up_proj.weight"))?,
-            is_bf16,
-        ),
-        down_proj: decode_weight_matrix(
-            model.get_tensor_payload(mtf_hash_name("model.layers.0.mlp.down_proj.weight"))?,
-            is_bf16,
-        ),
-        norm: decode_weight_matrix(
-            model.get_tensor_payload(mtf_hash_name("model.norm.weight"))?,
-            is_bf16,
-        ),
-    };
+    let mut layers = Vec::with_capacity(num_layers);
+    for l in 0..num_layers {
+        layers.push(ActiveLayer {
+            input_layernorm: decode_weight_matrix(
+                model.get_tensor_payload(mtf_hash_name(&format!(
+                    "model.layers.{}.input_layernorm.weight",
+                    l
+                )))?,
+                is_bf16,
+            ),
+            q_proj: decode_weight_matrix(
+                model.get_tensor_payload(mtf_hash_name(&format!(
+                    "model.layers.{}.self_attn.q_proj.weight",
+                    l
+                )))?,
+                is_bf16,
+            ),
+            k_proj: decode_weight_matrix(
+                model.get_tensor_payload(mtf_hash_name(&format!(
+                    "model.layers.{}.self_attn.k_proj.weight",
+                    l
+                )))?,
+                is_bf16,
+            ),
+            v_proj: decode_weight_matrix(
+                model.get_tensor_payload(mtf_hash_name(&format!(
+                    "model.layers.{}.self_attn.v_proj.weight",
+                    l
+                )))?,
+                is_bf16,
+            ),
+            o_proj: decode_weight_matrix(
+                model.get_tensor_payload(mtf_hash_name(&format!(
+                    "model.layers.{}.self_attn.o_proj.weight",
+                    l
+                )))?,
+                is_bf16,
+            ),
+            post_attention_layernorm: decode_weight_matrix(
+                model.get_tensor_payload(mtf_hash_name(&format!(
+                    "model.layers.{}.post_attention_layernorm.weight",
+                    l
+                )))?,
+                is_bf16,
+            ),
+            gate_proj: decode_weight_matrix(
+                model.get_tensor_payload(mtf_hash_name(&format!(
+                    "model.layers.{}.mlp.gate_proj.weight",
+                    l
+                )))?,
+                is_bf16,
+            ),
+            up_proj: decode_weight_matrix(
+                model.get_tensor_payload(mtf_hash_name(&format!(
+                    "model.layers.{}.mlp.up_proj.weight",
+                    l
+                )))?,
+                is_bf16,
+            ),
+            down_proj: decode_weight_matrix(
+                model.get_tensor_payload(mtf_hash_name(&format!(
+                    "model.layers.{}.mlp.down_proj.weight",
+                    l
+                )))?,
+                is_bf16,
+            ),
+        });
+    }
+
+    let final_norm_weight = decode_weight_matrix(
+        model.get_tensor_payload(mtf_hash_name("model.norm.weight"))?,
+        is_bf16,
+    );
 
     println!(
-        "[SUCCESS] Pre-decoded dynamic Layer 0 weights in {:?}",
+        "[SUCCESS] Pre-decoded dynamic Model layers in {:?}",
         start_decode.elapsed()
     );
 
@@ -608,189 +658,205 @@ fn main() -> Result<()> {
         let start_time = Instant::now();
 
         // 1. Tokenize Input
-        let input_tokens = tokenizer.tokenize(prompt);
-        let seq_len = input_tokens.len();
+        let mut gen_tokens = tokenizer.tokenize(prompt);
+        let prompt_len = gen_tokens.len();
 
-        if seq_len == 0 {
+        if prompt_len == 0 {
             println!("[-] Warning: Input contains no valid tokens.");
             continue;
         }
 
         println!(
-            "\n[CPU Math] Running real forward pass for sequence length: {}...",
-            seq_len
+            "\n[CPU Math] Executing autoregressive text generation over {} layers...",
+            num_layers
         );
+        print!("Assistant ❯ ");
+        stdout().flush()?;
 
-        // 2. Map & Decode Token Embeddings on CPU (with safety bounds checks)
-        let mut x_seq = vec![0.0f32; seq_len * hidden_size];
-        for i in 0..seq_len {
-            let token_id = input_tokens[i];
-            let offset = token_id as usize * (hidden_size * 2);
+        // Generate 15 tokens sequentially in an autoregressive loop
+        let max_new_tokens = 15;
+        for step in 0..max_new_tokens {
+            let seq_len = gen_tokens.len();
 
-            // Check if token_id exceeds target embedding tensor limits
-            let slice_offset = if offset + (hidden_size * 2) <= embed_payload.len() {
-                offset
-            } else {
-                println!("[-] Warning: Token ID {} out of embedding boundaries. Falling back to default.", token_id);
-                279 * (hidden_size * 2) // fallback token
-            };
+            // 2. Decode Token Embeddings on CPU
+            let mut x_seq = vec![0.0f32; seq_len * hidden_size];
+            for i in 0..seq_len {
+                let token_id = gen_tokens[i];
+                let offset = token_id as usize * (hidden_size * 2);
 
-            let token_slice = &embed_payload[slice_offset..slice_offset + (hidden_size * 2)];
-            for c in 0..hidden_size {
-                let b0 = token_slice[c * 2];
-                let b1 = token_slice[c * 2 + 1];
-                x_seq[i * hidden_size + c] = decode_half([b0, b1], is_bf16);
+                let slice_offset = if offset + (hidden_size * 2) <= embed_payload.len() {
+                    offset
+                } else {
+                    279 * (hidden_size * 2) // fallback token
+                };
+
+                let token_slice = &embed_payload[slice_offset..slice_offset + (hidden_size * 2)];
+                for c in 0..hidden_size {
+                    let b0 = token_slice[c * 2];
+                    let b1 = token_slice[c * 2 + 1];
+                    x_seq[i * hidden_size + c] = decode_half([b0, b1], is_bf16);
+                }
             }
+
+            // 3. Process activations sequentially through all detected layers
+            for l in 0..num_layers {
+                let layer = &layers[l];
+
+                let mut x_norm = vec![0.0f32; hidden_size];
+                let mut q_seq = vec![0.0f32; seq_len * hidden_size];
+                let mut k_seq = vec![0.0f32; seq_len * kv_proj_size];
+                let mut v_seq = vec![0.0f32; seq_len * kv_proj_size];
+
+                for i in 0..seq_len {
+                    rms_norm(
+                        &x_seq[i * hidden_size..(i + 1) * hidden_size],
+                        &layer.input_layernorm,
+                        &mut x_norm,
+                        1e-6,
+                    );
+
+                    let mut q_i = vec![0.0f32; hidden_size];
+                    let mut k_i = vec![0.0f32; kv_proj_size];
+                    let mut v_i = vec![0.0f32; kv_proj_size];
+
+                    matmul_vec(&mut q_i, &layer.q_proj, &x_norm, hidden_size, hidden_size);
+                    matmul_vec(&mut k_i, &layer.k_proj, &x_norm, kv_proj_size, hidden_size);
+                    matmul_vec(&mut v_i, &layer.v_proj, &x_norm, kv_proj_size, hidden_size);
+
+                    // Apply sinusoidal Rotary Position Embedding (RoPE)
+                    apply_rope(&mut q_i, &mut k_i, i, n_q_heads, n_kv_heads, head_dim);
+
+                    q_seq[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(&q_i);
+                    k_seq[i * kv_proj_size..(i + 1) * kv_proj_size].copy_from_slice(&k_i);
+                    v_seq[i * kv_proj_size..(i + 1) * kv_proj_size].copy_from_slice(&v_i);
+                }
+
+                // 4. GQA Attention calculation
+                let mut attn_out_seq = vec![0.0f32; seq_len * hidden_size];
+                GQA_attention(
+                    &q_seq,
+                    &k_seq,
+                    &v_seq,
+                    &mut attn_out_seq,
+                    seq_len,
+                    hidden_size,
+                    kv_proj_size,
+                    n_q_heads,
+                    group_size,
+                    head_dim,
+                );
+
+                // 5. Output Projection + Residual Add
+                let mut x_post_attn = vec![0.0f32; seq_len * hidden_size];
+                for i in 0..seq_len {
+                    let mut o_i = vec![0.0f32; hidden_size];
+                    matmul_vec(
+                        &mut o_i,
+                        &layer.o_proj,
+                        &attn_out_seq[i * hidden_size..(i + 1) * hidden_size],
+                        hidden_size,
+                        hidden_size,
+                    );
+                    for c in 0..hidden_size {
+                        x_post_attn[i * hidden_size + c] = x_seq[i * hidden_size + c] + o_i[c];
+                    }
+                }
+
+                // 6. Post Attention norm + MLP SwiGLU pass
+                for i in 0..seq_len {
+                    rms_norm(
+                        &x_post_attn[i * hidden_size..(i + 1) * hidden_size],
+                        &layer.post_attention_layernorm,
+                        &mut x_norm,
+                        1e-6,
+                    );
+
+                    let mut gate_i = vec![0.0f32; intermediate_size];
+                    let mut up_i = vec![0.0f32; intermediate_size];
+                    let mut swiglu_out = vec![0.0f32; intermediate_size];
+                    let mut down_i = vec![0.0f32; hidden_size];
+
+                    matmul_vec(
+                        &mut gate_i,
+                        &layer.gate_proj,
+                        &x_norm,
+                        intermediate_size,
+                        hidden_size,
+                    );
+                    matmul_vec(
+                        &mut up_i,
+                        &layer.up_proj,
+                        &x_norm,
+                        intermediate_size,
+                        hidden_size,
+                    );
+                    apply_swiglu(&gate_i, &up_i, &mut swiglu_out);
+                    matmul_vec(
+                        &mut down_i,
+                        &layer.down_proj,
+                        &swiglu_out,
+                        hidden_size,
+                        intermediate_size,
+                    );
+
+                    for c in 0..hidden_size {
+                        x_seq[i * hidden_size + c] = x_post_attn[i * hidden_size + c] + down_i[c];
+                    }
+                }
+            }
+
+            // 7. Post Model Norm on the Last Sequence Activation Vector
+            let last_hidden = &x_seq[(seq_len - 1) * hidden_size..seq_len * hidden_size];
+            let mut final_norm = vec![0.0f32; hidden_size];
+            rms_norm(last_hidden, &final_norm_weight, &mut final_norm, 1e-6);
+
+            // 8. Output vocabulary projection: logit multiplication over vocab list
+            let mut max_logit = f32::NEG_INFINITY;
+            let mut predicted_token_id = 279; // default fallback
+
+            for &(_, vocab_id) in &tokenizer.vocab {
+                let offset = vocab_id as usize * (hidden_size * 2);
+
+                let slice_offset = if offset + (hidden_size * 2) <= embed_payload.len() {
+                    offset
+                } else {
+                    279 * (hidden_size * 2) // fallback
+                };
+
+                let token_slice = &embed_payload[slice_offset..slice_offset + (hidden_size * 2)];
+                let mut vocab_vec = vec![0.0f32; hidden_size];
+                for c in 0..hidden_size {
+                    let b0 = token_slice[c * 2];
+                    let b1 = token_slice[c * 2 + 1];
+                    vocab_vec[c] = decode_half([b0, b1], is_bf16);
+                }
+
+                // Dot Product projection for vocab logit
+                let mut logit = 0.0f32;
+                for c in 0..hidden_size {
+                    logit += vocab_vec[c] * final_norm[c];
+                }
+
+                if logit > max_logit {
+                    max_logit = logit;
+                    predicted_token_id = vocab_id;
+                }
+            }
+
+            // Append predicted token for autoregressive loop
+            gen_tokens.push(predicted_token_id);
+
+            // Stream-print the predicted token
+            let word = tokenizer.decode_token(predicted_token_id);
+            print!("{}", word);
+            if step < max_new_tokens - 1 {
+                print!(" ");
+            }
+            stdout().flush()?;
         }
 
-        // 3. RMSNorm & Attention QKV Projections
-        let mut x_norm = vec![0.0f32; hidden_size];
-        let mut q_seq = vec![0.0f32; seq_len * hidden_size];
-        let mut k_seq = vec![0.0f32; seq_len * kv_proj_size];
-        let mut v_seq = vec![0.0f32; seq_len * kv_proj_size];
-
-        for i in 0..seq_len {
-            rms_norm(
-                &x_seq[i * hidden_size..(i + 1) * hidden_size],
-                &layer0.input_layernorm,
-                &mut x_norm,
-                1e-6,
-            );
-
-            let mut q_i = vec![0.0f32; hidden_size];
-            let mut k_i = vec![0.0f32; kv_proj_size];
-            let mut v_i = vec![0.0f32; kv_proj_size];
-
-            matmul_vec(&mut q_i, &layer0.q_proj, &x_norm, hidden_size, hidden_size);
-            matmul_vec(&mut k_i, &layer0.k_proj, &x_norm, kv_proj_size, hidden_size);
-            matmul_vec(&mut v_i, &layer0.v_proj, &x_norm, kv_proj_size, hidden_size);
-
-            // Apply sinusoidal Rotary Position Embedding (RoPE)
-            apply_rope(&mut q_i, &mut k_i, i, n_q_heads, n_kv_heads, head_dim);
-
-            q_seq[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(&q_i);
-            k_seq[i * kv_proj_size..(i + 1) * kv_proj_size].copy_from_slice(&k_i);
-            v_seq[i * kv_proj_size..(i + 1) * kv_proj_size].copy_from_slice(&v_i);
-        }
-
-        // 4. GQA Attention calculation
-        let mut attn_out_seq = vec![0.0f32; seq_len * hidden_size];
-        GQA_attention(
-            &q_seq,
-            &k_seq,
-            &v_seq,
-            &mut attn_out_seq,
-            seq_len,
-            hidden_size,
-            kv_proj_size,
-            n_q_heads,
-            group_size,
-            head_dim,
-        );
-
-        // 5. Output Projection + Residual Add
-        let mut x_post_attn = vec![0.0f32; seq_len * hidden_size];
-        for i in 0..seq_len {
-            let mut o_i = vec![0.0f32; hidden_size];
-            matmul_vec(
-                &mut o_i,
-                &layer0.o_proj,
-                &attn_out_seq[i * hidden_size..(i + 1) * hidden_size],
-                hidden_size,
-                hidden_size,
-            );
-            for c in 0..hidden_size {
-                x_post_attn[i * hidden_size + c] = x_seq[i * hidden_size + c] + o_i[c];
-            }
-        }
-
-        // 6. Post Attention norm + MLP SwiGLU pass
-        let mut x_final_seq = vec![0.0f32; seq_len * hidden_size];
-        for i in 0..seq_len {
-            rms_norm(
-                &x_post_attn[i * hidden_size..(i + 1) * hidden_size],
-                &layer0.post_attention_layernorm,
-                &mut x_norm,
-                1e-6,
-            );
-
-            let mut gate_i = vec![0.0f32; intermediate_size];
-            let mut up_i = vec![0.0f32; intermediate_size];
-            let mut swiglu_out = vec![0.0f32; intermediate_size];
-            let mut down_i = vec![0.0f32; hidden_size];
-
-            matmul_vec(
-                &mut gate_i,
-                &layer0.gate_proj,
-                &x_norm,
-                intermediate_size,
-                hidden_size,
-            );
-            matmul_vec(
-                &mut up_i,
-                &layer0.up_proj,
-                &x_norm,
-                intermediate_size,
-                hidden_size,
-            );
-            apply_swiglu(&gate_i, &up_i, &mut swiglu_out);
-            matmul_vec(
-                &mut down_i,
-                &layer0.down_proj,
-                &swiglu_out,
-                hidden_size,
-                intermediate_size,
-            );
-
-            for c in 0..hidden_size {
-                x_final_seq[i * hidden_size + c] = x_post_attn[i * hidden_size + c] + down_i[c];
-            }
-        }
-
-        // 7. Post Model Norm on the Last Sequence Activation Vector
-        let last_hidden = &x_final_seq[(seq_len - 1) * hidden_size..seq_len * hidden_size];
-        let mut final_norm = vec![0.0f32; hidden_size];
-        rms_norm(last_hidden, &layer0.norm, &mut final_norm, 1e-6);
-
-        // 8. Output vocabulary projection: logit multiplication over standard tied vocabulary
-        let mut max_logit = f32::NEG_INFINITY;
-        let mut predicted_token_id = 279; // default fallback
-
-        for &(_, vocab_id) in &tokenizer.vocab {
-            let offset = vocab_id as usize * (hidden_size * 2);
-
-            let slice_offset = if offset + (hidden_size * 2) <= embed_payload.len() {
-                offset
-            } else {
-                279 * (hidden_size * 2) // fallback token
-            };
-
-            let token_slice = &embed_payload[slice_offset..slice_offset + (hidden_size * 2)];
-            let mut vocab_vec = vec![0.0f32; hidden_size];
-            for c in 0..hidden_size {
-                let b0 = token_slice[c * 2];
-                let b1 = token_slice[c * 2 + 1];
-                vocab_vec[c] = decode_half([b0, b1], is_bf16);
-            }
-
-            // Real Dot Product projection for vocab logit
-            let mut logit = 0.0f32;
-            for c in 0..hidden_size {
-                logit += vocab_vec[c] * final_norm[c];
-            }
-
-            if logit > max_logit {
-                max_logit = logit;
-                predicted_token_id = vocab_id;
-            }
-        }
-
-        // Decode predicted token
-        let word = tokenizer.decode_token(predicted_token_id);
         let elapsed = start_time.elapsed();
-
-        println!("Assistant ❯ {} ", word);
-        println!("-------------------------------------------------------");
+        println!("\n-------------------------------------------------------");
         println!("  CPU Inference Latency: {:?}", elapsed);
         println!("-------------------------------------------------------");
     }
