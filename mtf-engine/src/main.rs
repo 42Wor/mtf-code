@@ -239,28 +239,23 @@ struct ActiveLayer {
     down_proj: Vec<f32>,
 }
 
-// RMSNorm implementation
+// Optimized RMSNorm implementation (Auto-vectorized by LLVM)
 fn rms_norm(input: &[f32], weight: &[f32], out: &mut [f32], eps: f32) {
     let size = input.len();
-    let mut sum = 0.0f32;
-    for &val in input {
-        sum += val * val;
-    }
+    let sum: f32 = input.iter().map(|&x| x * x).sum();
     let rms = (sum / size as f32 + eps).sqrt();
-    for i in 0..size {
-        out[i] = (input[i] / rms) * weight[i];
+
+    for (o, (&i, &w)) in out.iter_mut().zip(input.iter().zip(weight.iter())) {
+        *o = (i / rms) * w;
     }
 }
 
-// Matrix-Vector Multiplication: rows * cols
+// Optimized Matrix-Vector Multiplication (Auto-vectorized by LLVM)
 fn matmul_vec(out: &mut [f32], weight: &[f32], vec: &[f32], rows: usize, cols: usize) {
-    for r in 0..rows {
-        let mut sum = 0.0f32;
+    for (r, out_val) in out.iter_mut().enumerate().take(rows) {
         let row_offset = r * cols;
-        for c in 0..cols {
-            sum += weight[row_offset + c] * vec[c];
-        }
-        out[r] = sum;
+        let w_row = &weight[row_offset..row_offset + cols];
+        *out_val = w_row.iter().zip(vec.iter()).map(|(w, v)| w * v).sum();
     }
 }
 
@@ -306,8 +301,8 @@ fn apply_rope(
     }
 }
 
-// Grouped Query Attention (GQA) with Causal Masking
-fn GQA_attention(
+// Dynamic Grouped Query Attention (GQA) with Causal Masking
+fn gqa_attention(
     q_seq: &[f32],
     k_seq: &[f32],
     v_seq: &[f32],
@@ -367,12 +362,11 @@ fn GQA_attention(
     }
 }
 
-// SwiGLU activation
+// Optimized SwiGLU activation (Auto-vectorized by LLVM)
 fn apply_swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
-    for i in 0..gate.len() {
-        let g = gate[i];
+    for ((&g, &u), o) in gate.iter().zip(up.iter()).zip(out.iter_mut()) {
         let sig = 1.0 / (1.0 + (-g).exp());
-        out[i] = g * sig * up[i];
+        *o = g * sig * u;
     }
 }
 
@@ -466,7 +460,7 @@ impl SimpleTokenizer {
 
 fn main() -> Result<()> {
     println!("\n=======================================================");
-    println!("  MTF v2.0 CPU MATHEMATICAL INFERENCE CORE & CLIENT");
+    println!("  MTF CPU MATHEMATICAL INFERENCE CORE & CLIENT");
     println!("=======================================================");
 
     let model_path = "model.mtf";
@@ -733,7 +727,7 @@ fn main() -> Result<()> {
 
                 // 4. GQA Attention calculation
                 let mut attn_out_seq = vec![0.0f32; seq_len * hidden_size];
-                GQA_attention(
+                gqa_attention(
                     &q_seq,
                     &k_seq,
                     &v_seq,

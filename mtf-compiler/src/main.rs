@@ -1,8 +1,6 @@
 use byteorder::{LittleEndian, WriteBytesExt};
 use mtf_common::hash::mtf_hash_name;
-use mtf_common::{
-    ALIGNMENT_BOUNDARY, FORMAT_VERSION, MAGIC_BYTES, MAGIC_FOOTER, MIN_ENGINE_VERSION,
-};
+use mtf_common::{ALIGNMENT_BOUNDARY, MAGIC_BYTES, MAGIC_FOOTER};
 use safetensors::SafeTensors;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
@@ -98,7 +96,7 @@ fn decode_half(bytes: [u8; 2], is_bf16: bool) -> f32 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n[MZTensor Labs] Starting MTF v2.0 Compiler Pipeline...");
+    println!("\n[MZTensor Labs] Starting MTF Compiler Pipeline...");
 
     let possible_paths = vec![
         "test_models/qwen2-0.5b/model.safetensors",
@@ -181,7 +179,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        // Print structural compilation logs mimicking the GGUF converter style
         println!(
             "INFO:mtf-compiler: {:<40} {:>5} --> {:<4}, shape = {:?}",
             name, source_type_str, target_type_str, shape
@@ -207,12 +204,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_path = "model.mtf";
     let mut out = File::create(output_path)?;
 
-    // 1. Write Header (64 bytes)
+    // 1. Write Header (64 bytes) - Versioning removed, replaced with padding
     out.write_all(MAGIC_BYTES)?;
-    out.write_u32::<LittleEndian>(FORMAT_VERSION)?;
-    out.write_u32::<LittleEndian>(MIN_ENGINE_VERSION)?;
     out.write_u64::<LittleEndian>(tensors.len() as u64)?;
-    out.write_all(&[0u8; 40])?;
+    out.write_all(&[0u8; 48])?; // 8 + 8 + 48 = 64 bytes
 
     // 2. Write aligned payloads
     for t in &mut tensors {
@@ -263,7 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     out.write_all(MAGIC_FOOTER)?;
 
     println!(
-        "[SUCCESS] MTF v2.0 compilation finished successfully. Output: {}",
+        "[SUCCESS] MTF compilation finished successfully. Output: {}",
         output_path
     );
     Ok(())
