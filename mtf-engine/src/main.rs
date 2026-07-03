@@ -265,7 +265,7 @@ fn matmul_vec(out: &mut [f32], weight: &[f32], vec: &[f32], rows: usize, cols: u
     }
 }
 
-// Sinusoidal Rotary Position Embedding (RoPE) - Corrected to use GPT-NeoX half-dimension style
+// Sinusoidal Rotary Position Embedding (RoPE)
 fn apply_rope(
     q: &mut [f32],
     k: &mut [f32],
@@ -307,23 +307,30 @@ fn apply_rope(
     }
 }
 
-// Grouped Query Attention (GQA) with Causal Masking
-fn GQA_attention(q_seq: &[f32], k_seq: &[f32], v_seq: &[f32], out_seq: &mut [f32], seq_len: usize) {
-    let head_dim = 64;
-    let n_q_heads = 14;
-    let group_size = 7;
-
+// Dynamic Grouped Query Attention (GQA) with Causal Masking
+fn GQA_attention(
+    q_seq: &[f32],
+    k_seq: &[f32],
+    v_seq: &[f32],
+    out_seq: &mut [f32],
+    seq_len: usize,
+    hidden_size: usize,
+    kv_proj_size: usize,
+    n_q_heads: usize,
+    group_size: usize,
+    head_dim: usize,
+) {
     for i in 0..seq_len {
         for h in 0..n_q_heads {
             let kv_h = h / group_size;
-            let q_head_offset = i * 896 + h * head_dim;
+            let q_head_offset = i * hidden_size + h * head_dim;
             let q_slice = &q_seq[q_head_offset..q_head_offset + head_dim];
 
             let mut scores = vec![0.0f32; i + 1];
             let mut max_score = f32::NEG_INFINITY;
 
             for j in 0..=i {
-                let k_head_offset = j * 128 + kv_h * head_dim;
+                let k_head_offset = j * kv_proj_size + kv_h * head_dim;
                 let k_slice = &k_seq[k_head_offset..k_head_offset + head_dim];
 
                 let mut dot = 0.0f32;
@@ -348,11 +355,11 @@ fn GQA_attention(q_seq: &[f32], k_seq: &[f32], v_seq: &[f32], out_seq: &mut [f32
             }
 
             // Weighted sum over V
-            let out_head_offset = i * 896 + h * head_dim;
+            let out_head_offset = i * hidden_size + h * head_dim;
             for k_idx in 0..head_dim {
                 let mut val = 0.0f32;
                 for j in 0..=i {
-                    let v_head_offset = j * 128 + kv_h * head_dim;
+                    let v_head_offset = j * kv_proj_size + kv_h * head_dim;
                     val += scores[j] * v_seq[v_head_offset + k_idx];
                 }
                 out_seq[out_head_offset + k_idx] = val;
@@ -476,6 +483,47 @@ fn main() -> Result<()> {
         if is_bf16 { "BFloat16" } else { "FP16" }
     );
 
+    // --- DYNAMIC PARAMETERS RESOLUTION ---
+    let embed_info = model
+        .tensors()
+        .iter()
+        .find(|t| t.name_hash == mtf_hash_name("model.embed_tokens.weight"))
+        .expect("Could not resolve embedding matrix shape in compiled model");
+
+    let vocab_size = embed_info.shape[0] as usize;
+    let hidden_size = embed_info.shape[1] as usize;
+
+    let gate_proj_info = model
+        .tensors()
+        .iter()
+        .find(|t| t.name_hash == mtf_hash_name("model.layers.0.mlp.gate_proj.weight"))
+        .expect("Could not resolve gate projection shape in compiled model");
+    let intermediate_size = gate_proj_info.shape[0] as usize;
+
+    let k_proj_info = model
+        .tensors()
+        .iter()
+        .find(|t| t.name_hash == mtf_hash_name("model.layers.0.self_attn.k_proj.weight"))
+        .expect("Could not resolve attention projection shape in compiled model");
+    let kv_proj_size = k_proj_info.shape[0] as usize;
+
+    let head_dim = 64;
+    let n_q_heads = hidden_size / head_dim;
+    let n_kv_heads = kv_proj_size / head_dim;
+    let group_size = if n_kv_heads > 0 {
+        n_q_heads / n_kv_heads
+    } else {
+        1
+    };
+
+    println!("[+] Dynamic Model Architecture Resolved:");
+    println!("    - Vocabulary Size:      {}", vocab_size);
+    println!("    - Hidden Dimension:     {}", hidden_size);
+    println!("    - FFN Intermediate:     {}", intermediate_size);
+    println!("    - Attention Heads (Q):  {}", n_q_heads);
+    println!("    - Attention Heads (KV): {}", n_kv_heads);
+    println!("    - GQA Group Size:       {}", group_size);
+
     // --- CPU DECODER & REGISTER INIT ---
     println!("\n[*] Pre-decoding Layer 0 weights into CPU float registers...");
     let start_decode = Instant::now();
@@ -526,7 +574,7 @@ fn main() -> Result<()> {
     };
 
     println!(
-        "[SUCCESS] Pre-decoded 59.2 MB of dynamic Layer 0 weights in {:?}",
+        "[SUCCESS] Pre-decoded dynamic Layer 0 weights in {:?}",
         start_decode.elapsed()
     );
 
@@ -574,105 +622,134 @@ fn main() -> Result<()> {
         );
 
         // 2. Map & Decode Token Embeddings on CPU (with safety bounds checks)
-        let mut x_seq = vec![0.0f32; seq_len * 896];
+        let mut x_seq = vec![0.0f32; seq_len * hidden_size];
         for i in 0..seq_len {
             let token_id = input_tokens[i];
-            let offset = token_id as usize * 1792;
+            let offset = token_id as usize * (hidden_size * 2);
 
             // Check if token_id exceeds target embedding tensor limits
-            let slice_offset = if offset + 1792 <= embed_payload.len() {
+            let slice_offset = if offset + (hidden_size * 2) <= embed_payload.len() {
                 offset
             } else {
                 println!("[-] Warning: Token ID {} out of embedding boundaries. Falling back to default.", token_id);
-                279 * 1792 // fallback token
+                279 * (hidden_size * 2) // fallback token
             };
 
-            let token_slice = &embed_payload[slice_offset..slice_offset + 1792];
-            for c in 0..896 {
+            let token_slice = &embed_payload[slice_offset..slice_offset + (hidden_size * 2)];
+            for c in 0..hidden_size {
                 let b0 = token_slice[c * 2];
                 let b1 = token_slice[c * 2 + 1];
-                x_seq[i * 896 + c] = decode_half([b0, b1], is_bf16);
+                x_seq[i * hidden_size + c] = decode_half([b0, b1], is_bf16);
             }
         }
 
         // 3. RMSNorm & Attention QKV Projections
-        let mut x_norm = vec![0.0f32; 896];
-        let mut q_seq = vec![0.0f32; seq_len * 896];
-        let mut k_seq = vec![0.0f32; seq_len * 128];
-        let mut v_seq = vec![0.0f32; seq_len * 128];
+        let mut x_norm = vec![0.0f32; hidden_size];
+        let mut q_seq = vec![0.0f32; seq_len * hidden_size];
+        let mut k_seq = vec![0.0f32; seq_len * kv_proj_size];
+        let mut v_seq = vec![0.0f32; seq_len * kv_proj_size];
 
         for i in 0..seq_len {
             rms_norm(
-                &x_seq[i * 896..(i + 1) * 896],
+                &x_seq[i * hidden_size..(i + 1) * hidden_size],
                 &layer0.input_layernorm,
                 &mut x_norm,
                 1e-6,
             );
 
-            let mut q_i = vec![0.0f32; 896];
-            let mut k_i = vec![0.0f32; 128];
-            let mut v_i = vec![0.0f32; 128];
+            let mut q_i = vec![0.0f32; hidden_size];
+            let mut k_i = vec![0.0f32; kv_proj_size];
+            let mut v_i = vec![0.0f32; kv_proj_size];
 
-            matmul_vec(&mut q_i, &layer0.q_proj, &x_norm, 896, 896);
-            matmul_vec(&mut k_i, &layer0.k_proj, &x_norm, 128, 896);
-            matmul_vec(&mut v_i, &layer0.v_proj, &x_norm, 128, 896);
+            matmul_vec(&mut q_i, &layer0.q_proj, &x_norm, hidden_size, hidden_size);
+            matmul_vec(&mut k_i, &layer0.k_proj, &x_norm, kv_proj_size, hidden_size);
+            matmul_vec(&mut v_i, &layer0.v_proj, &x_norm, kv_proj_size, hidden_size);
 
             // Apply sinusoidal Rotary Position Embedding (RoPE)
-            apply_rope(&mut q_i, &mut k_i, i, 14, 2, 64);
+            apply_rope(&mut q_i, &mut k_i, i, n_q_heads, n_kv_heads, head_dim);
 
-            q_seq[i * 896..(i + 1) * 896].copy_from_slice(&q_i);
-            k_seq[i * 128..(i + 1) * 128].copy_from_slice(&k_i);
-            v_seq[i * 128..(i + 1) * 128].copy_from_slice(&v_i);
+            q_seq[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(&q_i);
+            k_seq[i * kv_proj_size..(i + 1) * kv_proj_size].copy_from_slice(&k_i);
+            v_seq[i * kv_proj_size..(i + 1) * kv_proj_size].copy_from_slice(&v_i);
         }
 
         // 4. GQA Attention calculation
-        let mut attn_out_seq = vec![0.0f32; seq_len * 896];
-        GQA_attention(&q_seq, &k_seq, &v_seq, &mut attn_out_seq, seq_len);
+        let mut attn_out_seq = vec![0.0f32; seq_len * hidden_size];
+        GQA_attention(
+            &q_seq,
+            &k_seq,
+            &v_seq,
+            &mut attn_out_seq,
+            seq_len,
+            hidden_size,
+            kv_proj_size,
+            n_q_heads,
+            group_size,
+            head_dim,
+        );
 
         // 5. Output Projection + Residual Add
-        let mut x_post_attn = vec![0.0f32; seq_len * 896];
+        let mut x_post_attn = vec![0.0f32; seq_len * hidden_size];
         for i in 0..seq_len {
-            let mut o_i = vec![0.0f32; 896];
+            let mut o_i = vec![0.0f32; hidden_size];
             matmul_vec(
                 &mut o_i,
                 &layer0.o_proj,
-                &attn_out_seq[i * 896..(i + 1) * 896],
-                896,
-                896,
+                &attn_out_seq[i * hidden_size..(i + 1) * hidden_size],
+                hidden_size,
+                hidden_size,
             );
-            for c in 0..896 {
-                x_post_attn[i * 896 + c] = x_seq[i * 896 + c] + o_i[c];
+            for c in 0..hidden_size {
+                x_post_attn[i * hidden_size + c] = x_seq[i * hidden_size + c] + o_i[c];
             }
         }
 
         // 6. Post Attention norm + MLP SwiGLU pass
-        let mut x_final_seq = vec![0.0f32; seq_len * 896];
+        let mut x_final_seq = vec![0.0f32; seq_len * hidden_size];
         for i in 0..seq_len {
             rms_norm(
-                &x_post_attn[i * 896..(i + 1) * 896],
+                &x_post_attn[i * hidden_size..(i + 1) * hidden_size],
                 &layer0.post_attention_layernorm,
                 &mut x_norm,
                 1e-6,
             );
 
-            let mut gate_i = vec![0.0f32; 4864];
-            let mut up_i = vec![0.0f32; 4864];
-            let mut swiglu_out = vec![0.0f32; 4864];
-            let mut down_i = vec![0.0f32; 896];
+            let mut gate_i = vec![0.0f32; intermediate_size];
+            let mut up_i = vec![0.0f32; intermediate_size];
+            let mut swiglu_out = vec![0.0f32; intermediate_size];
+            let mut down_i = vec![0.0f32; hidden_size];
 
-            matmul_vec(&mut gate_i, &layer0.gate_proj, &x_norm, 4864, 896);
-            matmul_vec(&mut up_i, &layer0.up_proj, &x_norm, 4864, 896);
+            matmul_vec(
+                &mut gate_i,
+                &layer0.gate_proj,
+                &x_norm,
+                intermediate_size,
+                hidden_size,
+            );
+            matmul_vec(
+                &mut up_i,
+                &layer0.up_proj,
+                &x_norm,
+                intermediate_size,
+                hidden_size,
+            );
             apply_swiglu(&gate_i, &up_i, &mut swiglu_out);
-            matmul_vec(&mut down_i, &layer0.down_proj, &swiglu_out, 896, 4864);
+            matmul_vec(
+                &mut down_i,
+                &layer0.down_proj,
+                &swiglu_out,
+                hidden_size,
+                intermediate_size,
+            );
 
-            for c in 0..896 {
-                x_final_seq[i * 896 + c] = x_post_attn[i * 896 + c] + down_i[c];
+            for c in 0..hidden_size {
+                x_final_seq[i * hidden_size + c] = x_post_attn[i * hidden_size + c] + down_i[c];
             }
         }
 
         // 7. Post Model Norm on the Last Sequence Activation Vector
-        let last_hidden = &x_final_seq[(seq_len - 1) * 896..seq_len * 896];
-        let mut final_norm = vec![0.0f32; 896];
+        let last_hidden = &x_final_seq[(seq_len - 1) * hidden_size..seq_len * hidden_size];
+        let mut final_norm = vec![0.0f32; hidden_size];
         rms_norm(last_hidden, &layer0.norm, &mut final_norm, 1e-6);
 
         // 8. Output vocabulary projection: logit multiplication over standard tied vocabulary
@@ -680,10 +757,17 @@ fn main() -> Result<()> {
         let mut predicted_token_id = 279; // default fallback
 
         for &(_, vocab_id) in &tokenizer.vocab {
-            let offset = vocab_id as usize * 1792;
-            let token_slice = &embed_payload[offset..offset + 1792];
-            let mut vocab_vec = vec![0.0f32; 896];
-            for c in 0..896 {
+            let offset = vocab_id as usize * (hidden_size * 2);
+
+            let slice_offset = if offset + (hidden_size * 2) <= embed_payload.len() {
+                offset
+            } else {
+                279 * (hidden_size * 2) // fallback token
+            };
+
+            let token_slice = &embed_payload[slice_offset..slice_offset + (hidden_size * 2)];
+            let mut vocab_vec = vec![0.0f32; hidden_size];
+            for c in 0..hidden_size {
                 let b0 = token_slice[c * 2];
                 let b1 = token_slice[c * 2 + 1];
                 vocab_vec[c] = decode_half([b0, b1], is_bf16);
@@ -691,7 +775,7 @@ fn main() -> Result<()> {
 
             // Real Dot Product projection for vocab logit
             let mut logit = 0.0f32;
-            for c in 0..896 {
+            for c in 0..hidden_size {
                 logit += vocab_vec[c] * final_norm[c];
             }
 
