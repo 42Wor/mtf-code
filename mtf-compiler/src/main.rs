@@ -68,11 +68,7 @@ fn decode_half(bytes: [u8; 2], is_bf16: bool) -> f32 {
             sign_f * (mant as f32) * 2.0f32.powi(-24)
         } else if exp == 31 {
             if mant == 0 {
-                if sign == 1 {
-                    f32::NEG_INFINITY
-                } else {
-                    f32::INFINITY
-                }
+                if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
             } else {
                 f32::NAN
             }
@@ -128,23 +124,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => "Unknown",
         };
 
-        let (target_type_str, data_type) = if name.contains("norm") {
-            ("F32", 0)
-        } else {
-            ("F16", 1)
-        };
+        // --- FIX: always store as F32 to avoid overflow ---
+        let (target_type_str, data_type) = ("F32", 0);
 
-        let converted_data = match (tensor.dtype(), data_type) {
-            (safetensors::Dtype::F32, 1) => {
-                let elements = raw_data.len() / 4;
-                let mut converted = Vec::with_capacity(elements * 2);
-                for chunk in raw_data.chunks_exact(4) {
-                    let val = f32::from_le_bytes(chunk.try_into().unwrap());
-                    converted.extend_from_slice(&f32_to_f16(val).to_le_bytes());
-                }
-                TensorData::Owned(converted)
-            }
-            (safetensors::Dtype::F16, 0) | (safetensors::Dtype::BF16, 0) => {
+        let converted_data = match tensor.dtype() {
+            safetensors::Dtype::F32 => TensorData::Borrowed(raw_data),
+            safetensors::Dtype::F16 | safetensors::Dtype::BF16 => {
                 let elements = raw_data.len() / 2;
                 let mut converted = Vec::with_capacity(elements * 4);
                 let is_bf16 = tensor.dtype() == safetensors::Dtype::BF16;

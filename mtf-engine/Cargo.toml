@@ -5,6 +5,7 @@ edition = "2021"
 authors = ["Maaz <MZTensor Labs>"]
 
 [dependencies]
+rand = "0.8"
 tokenizers = "0.19"
 mtf-common = { path = "../mtf-common" }
 memmap2 = "0.9.11"

@@ -404,6 +404,7 @@ version = "1.0.0"
 dependencies = [
  "memmap2",
  "mtf-common",
+ "rand",
  "serde",
  "serde_json",
  "tokenizers",

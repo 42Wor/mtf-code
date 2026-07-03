@@ -1,12 +1,13 @@
 use memmap2::Mmap;
 use mtf_common::hash::mtf_hash_name;
 use mtf_common::{MAGIC_BYTES, MAGIC_FOOTER};
+use rand::Rng;
 use std::fmt;
 use std::fs::File;
 use std::io::{stdin, stdout, Read, Write};
 use std::path::Path;
 use std::time::Instant;
-use tokenizers::Tokenizer; // <-- real BPE tokenizer
+use tokenizers::Tokenizer;
 
 #[derive(Debug)]
 pub enum MtfError {
@@ -182,11 +183,7 @@ fn decode_f16(bytes: [u8; 2]) -> f32 {
         sign_f * (mant as f32) * 2.0f32.powi(-24)
     } else if exp == 31 {
         if mant == 0 {
-            if sign == 1 {
-                f32::NEG_INFINITY
-            } else {
-                f32::INFINITY
-            }
+            if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
         } else {
             f32::NAN
         }
@@ -375,17 +372,15 @@ fn apply_swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
-// ============================================================
-//  DynamicTokenizer using the 'tokenizers' crate
-// ============================================================
+// Real BPE tokenizer wrapper
 struct DynamicTokenizer {
     tokenizer: Tokenizer,
 }
 
 impl DynamicTokenizer {
     fn new(metadata_json: &str) -> Self {
-        let meta: serde_json::Value =
-            serde_json::from_str(metadata_json).expect("Failed to parse metadata JSON");
+        let meta: serde_json::Value = serde_json::from_str(metadata_json)
+            .expect("Failed to parse metadata JSON");
         let tokenizer_json = meta["tokenizer"].to_string();
         let tokenizer = Tokenizer::from_bytes(tokenizer_json.as_bytes())
             .expect("Failed to load tokenizer from metadata");
@@ -393,16 +388,13 @@ impl DynamicTokenizer {
     }
 
     fn tokenize(&self, text: &str) -> Vec<u32> {
-        let encoding = self
-            .tokenizer
-            .encode(text, true)
+        let encoding = self.tokenizer.encode(text, true)
             .expect("Tokenization failed");
         encoding.get_ids().to_vec()
     }
 
     fn decode_token(&self, id: u32) -> String {
-        self.tokenizer
-            .id_to_token(id)
+        self.tokenizer.id_to_token(id)
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("<unk:{}>", id))
     }
@@ -410,7 +402,7 @@ impl DynamicTokenizer {
 
 fn main() -> Result<()> {
     println!("\n=======================================================");
-    println!("  MTF CPU MATHEMATICAL INFERENCE CORE & CLIENT");
+    println!("  MTF CPU MATHEMATICAL INFERENCE CORE & CLIENT (F32)");
     println!("=======================================================");
 
     let model_path = "model.mtf";
@@ -450,11 +442,7 @@ fn main() -> Result<()> {
     let head_dim = 64;
     let n_q_heads = hidden_size / head_dim;
     let n_kv_heads = kv_proj_size / head_dim;
-    let group_size = if n_kv_heads > 0 {
-        n_q_heads / n_kv_heads
-    } else {
-        1
-    };
+    let group_size = if n_kv_heads > 0 { n_q_heads / n_kv_heads } else { 1 };
 
     let mut num_layers = 0;
     while model
@@ -554,9 +542,7 @@ fn main() -> Result<()> {
 
     let embed_tokens_f32 = decode_weight_matrix(embed_payload, embed_qtype);
 
-    // ============================================================
-    //  lm_head – fallback to tied embeddings if missing
-    // ============================================================
+    // lm_head fallback (tied embeddings)
     let lm_head_f32 = match model.get_tensor(mtf_hash_name("lm_head.weight")) {
         Ok((payload, qtype)) => {
             println!("[+] Loaded separate lm_head.weight");
@@ -573,10 +559,24 @@ fn main() -> Result<()> {
         start_decode.elapsed()
     );
 
-    println!("\n[Launch] Launching True CPU Inference Terminal...");
+    println!("\n[Launch] Launching True CPU Inference Terminal (F32)");
     println!("-------------------------------------------------------");
 
     let tokenizer = DynamicTokenizer::new(model.get_metadata());
+
+    // ---- Get BOS and EOS from config ----
+    let config: serde_json::Value = serde_json::from_str(model.get_metadata())
+        .expect("Failed to parse metadata JSON");
+    let bos_token_id = config["config"]["bos_token_id"].as_u64().unwrap_or(151643) as u32;
+    let eos_token_id = config["config"]["eos_token_id"].as_u64().unwrap_or(151643) as u32;
+
+    // ---- Test tokenizer ----
+    let test_text = "hi";
+    let test_tokens = tokenizer.tokenize(test_text);
+    println!("[DEBUG] Tokenization of '{}' -> {:?}", test_text, test_tokens);
+    for &id in &test_tokens {
+        println!("[DEBUG]   {} -> '{}'", id, tokenizer.decode_token(id));
+    }
 
     loop {
         print!("\nUser ❯ ");
@@ -597,20 +597,20 @@ fn main() -> Result<()> {
 
         let start_time = Instant::now();
         let mut gen_tokens = tokenizer.tokenize(prompt);
-
         if gen_tokens.is_empty() {
             continue;
         }
 
-        println!("[*] Tokenized prompt IDs: {:?}", gen_tokens);
-        println!(
-            "\n[CPU Math] Executing autoregressive text generation over {} layers...",
-            num_layers
-        );
+        // ---- Prepend BOS ----
+        gen_tokens.insert(0, bos_token_id);
+        println!("[*] Tokenized prompt + BOS: {:?}", gen_tokens);
+
         print!("Assistant ❯ ");
         stdout().flush()?;
 
-        let max_new_tokens = 25;
+        let max_new_tokens = 20;
+        let temperature = 0.7;
+
         for _step in 0..max_new_tokens {
             let seq_len = gen_tokens.len();
             let mut x_seq = vec![0.0f32; seq_len * hidden_size];
@@ -619,7 +619,6 @@ fn main() -> Result<()> {
                 let token_id = gen_tokens[i] as usize;
                 let start = token_id * hidden_size;
                 let end = start + hidden_size;
-
                 let slice = if end <= embed_tokens_f32.len() {
                     &embed_tokens_f32[start..end]
                 } else {
@@ -628,6 +627,7 @@ fn main() -> Result<()> {
                 x_seq[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(slice);
             }
 
+            // Forward pass
             for l in 0..num_layers {
                 let layer = &layers[l];
                 let mut x_norm = vec![0.0f32; hidden_size];
@@ -752,43 +752,47 @@ fn main() -> Result<()> {
             let mut final_norm = vec![0.0f32; hidden_size];
             rms_norm(last_hidden, &final_norm_weight, &mut final_norm, 1e-6);
 
-            // ============================================================
-            // Use lm_head (or tied embeddings) for logits
-            // ============================================================
+            // Compute logits
             let mut logits = vec![0.0f32; vocab_size];
             for vocab_id in 0..vocab_size {
                 let start = vocab_id * hidden_size;
                 let end = start + hidden_size;
-                if end > lm_head_f32.len() {
-                    continue;
-                }
+                if end > lm_head_f32.len() { continue; }
                 let lm_row = &lm_head_f32[start..end];
-                logits[vocab_id] = lm_row
-                    .iter()
-                    .zip(final_norm.iter())
-                    .map(|(w, x)| w * x)
-                    .sum();
+                logits[vocab_id] = lm_row.iter().zip(final_norm.iter()).map(|(w, x)| w * x).sum();
             }
 
-            // Repetition Penalty
-            let penalty = 1.1f32;
+            // Repetition penalty
+            let penalty = 1.1;
             for &token_id in &gen_tokens {
                 let idx = token_id as usize;
-                if logits[idx] > 0.0 {
-                    logits[idx] /= penalty;
-                } else {
-                    logits[idx] *= penalty;
+                if logits[idx] > 0.0 { logits[idx] /= penalty; }
+                else { logits[idx] *= penalty; }
+            }
+
+            // ---- Temperature sampling ----
+            let mut rng = rand::thread_rng();
+            let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let exp_sum: f32 = logits.iter()
+                .map(|&x| ((x - max_logit) / temperature).exp())
+                .sum();
+            let mut probs = Vec::with_capacity(vocab_size);
+            let mut cumulative = 0.0;
+            for &x in &logits {
+                let p = ((x - max_logit) / temperature).exp() / exp_sum;
+                cumulative += p;
+                probs.push(cumulative);
+            }
+            let sample: f32 = rand::Rng::gen(&mut rng);
+            let mut predicted_token_id = 0;
+            for (i, &c) in probs.iter().enumerate() {
+                if sample <= c {
+                    predicted_token_id = i as u32;
+                    break;
                 }
             }
 
-            let mut max_logit = f32::NEG_INFINITY;
-            let mut predicted_token_id = 0;
-            for (i, &l) in logits.iter().enumerate() {
-                if l > max_logit {
-                    max_logit = l;
-                    predicted_token_id = i as u32;
-                }
-            }
+            if predicted_token_id == eos_token_id { break; }
 
             gen_tokens.push(predicted_token_id);
             let word = tokenizer.decode_token(predicted_token_id);
