@@ -12,7 +12,11 @@ pub fn decode_half(bytes: [u8; 2], is_bf16: bool) -> f32 {
             sign_f * (mant as f32) * 2.0f32.powi(-24)
         } else if exp == 31 {
             if mant == 0 {
-                if sign == 1 { f32::NEG_INFINITY } else { f32::INFINITY }
+                if sign == 1 {
+                    f32::NEG_INFINITY
+                } else {
+                    f32::INFINITY
+                }
             } else {
                 f32::NAN
             }

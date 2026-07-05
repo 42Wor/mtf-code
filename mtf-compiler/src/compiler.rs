@@ -1,6 +1,9 @@
 use crate::metadata::build_metadata_json;
 use crate::tensor::{process_tensor_data, CompileTensor};
+use crate::validator::validate_tensor_shapes;
+use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use mtf_common::hash::mtf_hash_name;
 use mtf_common::{ALIGNMENT_BOUNDARY, MAGIC_BYTES, MAGIC_FOOTER};
 use safetensors::SafeTensors;
@@ -8,28 +11,49 @@ use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::Path;
 
-pub fn run_compile(input_dir: &Path, output_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Find safetensors file
+pub const MTF_VERSION: u32 = 1;
+
+pub fn run_compile(input_dir: &Path, output_path: &Path) -> Result<()> {
     let safetensors_path = input_dir.join("model.safetensors");
     if !safetensors_path.exists() {
-        return Err(format!("model.safetensors not found in {:?}", input_dir).into());
+        anyhow::bail!("model.safetensors not found in {:?}", input_dir);
     }
 
-    // 2. Build Metadata (Config + Tokenizer)
-    println!("[*] Assembling metadata bundle...");
+    log::info!("Assembling metadata bundle...");
     let metadata_str = build_metadata_json(input_dir)?;
-    let compressed_meta = zstd::encode_all(metadata_str.as_bytes(), 3)?;
+    let compressed_meta =
+        zstd::encode_all(metadata_str.as_bytes(), 3).context("Failed to compress metadata")?;
     let metadata_size = compressed_meta.len() as u64;
 
-    // 3. Process Tensors
-    println!("[*] Memory mapping safetensors...");
+    let config_path = input_dir.join("config.json");
+    let config_json: Option<serde_json::Value> = if config_path.exists() {
+        let config_str = std::fs::read_to_string(&config_path)?;
+        Some(serde_json::from_str(&config_str)?)
+    } else {
+        log::warn!("config.json not found – skipping shape validation");
+        None
+    };
+
+    log::info!("Memory mapping safetensors...");
     let in_file = File::open(&safetensors_path)?;
     let mmap = unsafe { memmap2::Mmap::map(&in_file)? };
     let st = SafeTensors::deserialize(&mmap)?;
 
-    let mut tensors = Vec::new();
-    
-    println!("[*] Processing tensors (Multi-threaded F16/BF16 -> F32 conversion)...");
+    let tensor_count = st.tensors().len();
+    let pb = ProgressBar::new(tensor_count as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    pb.set_message("Converting tensors");
+
+    let mut tensors = Vec::with_capacity(tensor_count);
+    let mut tensor_names = Vec::new();
+
     for (name, tensor) in st.tensors() {
         let hash = mtf_hash_name(&name);
         let raw_data = tensor.data();
@@ -44,34 +68,58 @@ pub fn run_compile(input_dir: &Path, output_path: &Path) -> Result<(), Box<dyn s
         };
 
         let converted_data = process_tensor_data(raw_data, dtype);
-
-        println!(
-            "  -> {:<40} {:>5} --> F32, shape = {:?}",
-            name, source_type_str, shape
+        log::debug!(
+            "Tensor: {} ({} -> F32) shape = {:?}",
+            name,
+            source_type_str,
+            shape
         );
 
         tensors.push(CompileTensor {
             hash,
-            name: name.clone(),
-            shape,
-            data_type: 0, // 0 = F32
+            shape: shape.clone(),
+            data_type: 0,
             raw_data: converted_data,
             absolute_offset: 0,
         });
+        tensor_names.push((name.clone(), shape));
+        pb.inc(1);
+    }
+
+    pb.finish_with_message("Tensor conversion complete");
+
+    if let Some(config) = config_json {
+        if let Err(e) = validate_tensor_shapes(&tensor_names, &config) {
+            log::warn!("Shape validation issues: {}", e);
+        } else {
+            log::info!("All tensor shapes validated against config.");
+        }
     }
 
     tensors.sort_by_key(|t| t.hash);
-    println!("[+] Index built & sorted. Writing {} tensors to disk...", tensors.len());
+    log::info!(
+        "Index built and sorted. Writing {} tensors...",
+        tensors.len()
+    );
 
-    // 4. Write MTF File
     let mut out = File::create(output_path)?;
+    let write_pb = ProgressBar::new(tensors.len() as u64);
+    write_pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} (writing)",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
 
     // Header
     out.write_all(MAGIC_BYTES)?;
+    out.write_u32::<LittleEndian>(MTF_VERSION)?;
     out.write_u64::<LittleEndian>(tensors.len() as u64)?;
-    out.write_all(&[0u8; 48])?;
+    out.write_all(&[0u8; 44])?;
 
-    // Tensor Payloads (Aligned)
+    // Payloads
     for t in &mut tensors {
         let current_pos = out.stream_position()?;
         let boundary_modulo = current_pos % ALIGNMENT_BOUNDARY;
@@ -81,7 +129,9 @@ pub fn run_compile(input_dir: &Path, output_path: &Path) -> Result<(), Box<dyn s
         }
         t.absolute_offset = out.stream_position()?;
         out.write_all(t.raw_data.as_slice())?;
+        write_pb.inc(1);
     }
+    write_pb.finish_with_message("Payload written");
 
     // Index
     let index_offset = out.stream_position()?;
@@ -95,7 +145,7 @@ pub fn run_compile(input_dir: &Path, output_path: &Path) -> Result<(), Box<dyn s
         }
     }
 
-    // Metadata Block
+    // Metadata
     let metadata_offset = out.stream_position()?;
     out.write_all(&compressed_meta)?;
 
@@ -103,9 +153,10 @@ pub fn run_compile(input_dir: &Path, output_path: &Path) -> Result<(), Box<dyn s
     out.write_u64::<LittleEndian>(index_offset)?;
     out.write_u64::<LittleEndian>(metadata_offset)?;
     out.write_u64::<LittleEndian>(metadata_size)?;
-    out.write_all(&[0u8; 32])?;
+    out.write_u32::<LittleEndian>(MTF_VERSION)?;
+    out.write_all(&[0u8; 28])?;
     out.write_all(MAGIC_FOOTER)?;
 
-    println!("[SUCCESS] MTF compilation finished successfully. Output: {:?}", output_path);
+    log::info!("MTF file written to {:?}", output_path);
     Ok(())
 }
