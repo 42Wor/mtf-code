@@ -2,6 +2,7 @@ use memmap2::Mmap;
 use mtf_common::hash::mtf_hash_name;
 use mtf_common::{MAGIC_BYTES, MAGIC_FOOTER};
 use rand::Rng;
+use serde::Deserialize;
 use std::fmt;
 use std::fs::File;
 use std::io::{stdin, stdout, Read, Write};
@@ -223,14 +224,49 @@ fn decode_weight_matrix(payload: &[u8], quant_type: u8) -> Vec<f32> {
     }
 }
 
+/// Helper to safely fetch optional tensors (like biases)
+fn get_optional_tensor(model: &MtfModel, name: &str) -> Result<Option<Vec<f32>>> {
+    match model.get_tensor(mtf_hash_name(name)) {
+        Ok((payload, qtype)) => Ok(Some(decode_weight_matrix(payload, qtype))),
+        Err(MtfError::TensorNotFound(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelConfig {
+    pub model_type: Option<String>,
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: Option<usize>,
+    pub head_dim: Option<usize>,
+    pub rms_norm_eps: Option<f32>,
+    pub rope_theta: Option<f32>,
+    pub bos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
+}
+
+impl ModelConfig {
+    pub fn get_kv_heads(&self) -> usize {
+        self.num_key_value_heads.unwrap_or(self.num_attention_heads)
+    }
+    pub fn get_head_dim(&self) -> usize {
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+}
+
 struct ActiveLayer {
     input_layernorm: Vec<f32>,
     q_proj: Vec<f32>,
-    q_bias: Vec<f32>,
+    q_bias: Option<Vec<f32>>,
     k_proj: Vec<f32>,
-    k_bias: Vec<f32>,
+    k_bias: Option<Vec<f32>>,
     v_proj: Vec<f32>,
-    v_bias: Vec<f32>,
+    v_bias: Option<Vec<f32>>,
     o_proj: Vec<f32>,
     post_attention_layernorm: Vec<f32>,
     gate_proj: Vec<f32>,
@@ -282,12 +318,13 @@ fn apply_rope(
     n_q_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    theta_base: f32,
 ) {
     let half_dim = head_dim / 2;
     for h in 0..n_q_heads {
         let offset = h * head_dim;
         for c in 0..half_dim {
-            let theta = 1000000.0f32.powf(-2.0 * (c as f32) / (head_dim as f32));
+            let theta = theta_base.powf(-2.0 * (c as f32) / (head_dim as f32));
             let angle = (pos as f32) * theta;
             let cos_val = angle.cos();
             let sin_val = angle.sin();
@@ -300,7 +337,7 @@ fn apply_rope(
     for h in 0..n_kv_heads {
         let offset = h * head_dim;
         for c in 0..half_dim {
-            let theta = 1000000.0f32.powf(-2.0 * (c as f32) / (head_dim as f32));
+            let theta = theta_base.powf(-2.0 * (c as f32) / (head_dim as f32));
             let angle = (pos as f32) * theta;
             let cos_val = angle.cos();
             let sin_val = angle.sin();
@@ -421,58 +458,44 @@ fn main() -> Result<()> {
     let model = MtfModel::load(model_path)?;
     println!("[+] MTF Model loaded successfully.");
 
-    let (embed_payload, embed_qtype) = model
-        .get_tensor(mtf_hash_name("model.embed_tokens.weight"))
-        .unwrap();
-    let embed_info = model
-        .tensors()
-        .iter()
-        .find(|t| t.name_hash == mtf_hash_name("model.embed_tokens.weight"))
-        .unwrap();
-    let vocab_size = embed_info.shape[0] as usize;
-    let hidden_size = embed_info.shape[1] as usize;
+    // --- Phase 1: Dynamic Configuration Parsing ---
+    let meta: serde_json::Value =
+        serde_json::from_str(model.get_metadata()).expect("Failed to parse metadata JSON");
 
-    let gate_proj_info = model
-        .tensors()
-        .iter()
-        .find(|t| t.name_hash == mtf_hash_name("model.layers.0.mlp.gate_proj.weight"))
-        .unwrap();
-    let intermediate_size = gate_proj_info.shape[0] as usize;
+    let config: ModelConfig = serde_json::from_value(meta["config"].clone())
+        .expect("Failed to parse ModelConfig from metadata");
 
-    let k_proj_info = model
-        .tensors()
-        .iter()
-        .find(|t| t.name_hash == mtf_hash_name("model.layers.0.self_attn.k_proj.weight"))
-        .unwrap();
-    let kv_proj_size = k_proj_info.shape[0] as usize;
-
-    let head_dim = 64;
-    let n_q_heads = hidden_size / head_dim;
-    let n_kv_heads = kv_proj_size / head_dim;
+    let vocab_size = config.vocab_size;
+    let hidden_size = config.hidden_size;
+    let intermediate_size = config.intermediate_size;
+    let num_layers = config.num_hidden_layers;
+    let n_q_heads = config.num_attention_heads;
+    let n_kv_heads = config.get_kv_heads();
+    let head_dim = config.get_head_dim();
     let group_size = if n_kv_heads > 0 {
         n_q_heads / n_kv_heads
     } else {
         1
     };
 
-    let mut num_layers = 0;
-    while model
-        .get_tensor(mtf_hash_name(&format!(
-            "model.layers.{}.input_layernorm.weight",
-            num_layers
-        )))
-        .is_ok()
-    {
-        num_layers += 1;
-    }
+    let rms_norm_eps = config.rms_norm_eps.unwrap_or(1e-6);
+    let rope_theta = config.rope_theta.unwrap_or(10000.0);
+    let kv_proj_size = n_kv_heads * head_dim;
 
     println!("[+] Dynamic Model Architecture Resolved:");
+    println!(
+        "    - Model Type:           {}",
+        config.model_type.as_deref().unwrap_or("Unknown")
+    );
     println!("    - Vocabulary Size:      {}", vocab_size);
     println!("    - Hidden Dimension:     {}", hidden_size);
     println!("    - FFN Intermediate:     {}", intermediate_size);
     println!("    - Attention Heads (Q):  {}", n_q_heads);
     println!("    - Attention Heads (KV): {}", n_kv_heads);
+    println!("    - Head Dimension:       {}", head_dim);
     println!("    - GQA Group Size:       {}", group_size);
+    println!("    - RMS Norm Epsilon:     {}", rms_norm_eps);
+    println!("    - RoPE Theta:           {}", rope_theta);
     println!("    - Layers Detected:      {}", num_layers);
 
     println!(
@@ -491,26 +514,23 @@ fn main() -> Result<()> {
             "model.layers.{}.self_attn.q_proj.weight",
             l
         )))?;
-        let (q_bias_p, q_bias_q) = model.get_tensor(mtf_hash_name(&format!(
-            "model.layers.{}.self_attn.q_proj.bias",
-            l
-        )))?;
+        let q_bias =
+            get_optional_tensor(&model, &format!("model.layers.{}.self_attn.q_proj.bias", l))?;
+
         let (k_proj_p, k_proj_q) = model.get_tensor(mtf_hash_name(&format!(
             "model.layers.{}.self_attn.k_proj.weight",
             l
         )))?;
-        let (k_bias_p, k_bias_q) = model.get_tensor(mtf_hash_name(&format!(
-            "model.layers.{}.self_attn.k_proj.bias",
-            l
-        )))?;
+        let k_bias =
+            get_optional_tensor(&model, &format!("model.layers.{}.self_attn.k_proj.bias", l))?;
+
         let (v_proj_p, v_proj_q) = model.get_tensor(mtf_hash_name(&format!(
             "model.layers.{}.self_attn.v_proj.weight",
             l
         )))?;
-        let (v_bias_p, v_bias_q) = model.get_tensor(mtf_hash_name(&format!(
-            "model.layers.{}.self_attn.v_proj.bias",
-            l
-        )))?;
+        let v_bias =
+            get_optional_tensor(&model, &format!("model.layers.{}.self_attn.v_proj.bias", l))?;
+
         let (o_proj_p, o_proj_q) = model.get_tensor(mtf_hash_name(&format!(
             "model.layers.{}.self_attn.o_proj.weight",
             l
@@ -535,11 +555,11 @@ fn main() -> Result<()> {
         layers.push(ActiveLayer {
             input_layernorm: decode_weight_matrix(in_norm_p, in_norm_q),
             q_proj: decode_weight_matrix(q_proj_p, q_proj_q),
-            q_bias: decode_weight_matrix(q_bias_p, q_bias_q),
+            q_bias,
             k_proj: decode_weight_matrix(k_proj_p, k_proj_q),
-            k_bias: decode_weight_matrix(k_bias_p, k_bias_q),
+            k_bias,
             v_proj: decode_weight_matrix(v_proj_p, v_proj_q),
-            v_bias: decode_weight_matrix(v_bias_p, v_bias_q),
+            v_bias,
             o_proj: decode_weight_matrix(o_proj_p, o_proj_q),
             post_attention_layernorm: decode_weight_matrix(post_norm_p, post_norm_q),
             gate_proj: decode_weight_matrix(gate_proj_p, gate_proj_q),
@@ -551,6 +571,8 @@ fn main() -> Result<()> {
     let (norm_payload, norm_qtype) = model.get_tensor(mtf_hash_name("model.norm.weight"))?;
     let final_norm_weight = decode_weight_matrix(norm_payload, norm_qtype);
 
+    let (embed_payload, embed_qtype) =
+        model.get_tensor(mtf_hash_name("model.embed_tokens.weight"))?;
     let embed_tokens_f32 = decode_weight_matrix(embed_payload, embed_qtype);
 
     // lm_head fallback (tied embeddings)
@@ -575,26 +597,9 @@ fn main() -> Result<()> {
 
     let tokenizer = DynamicTokenizer::new(model.get_metadata());
 
-    // ---- Get BOS and EOS from config ----
-    let config: serde_json::Value =
-        serde_json::from_str(model.get_metadata()).expect("Failed to parse metadata JSON");
-    let bos_token_id = config["config"]["bos_token_id"].as_u64().unwrap_or(151643) as u32;
-    let eos_token_id = config["config"]["eos_token_id"].as_u64().unwrap_or(151643) as u32;
-
-    // ---- Test tokenizer ----
-    let test_text = "hi";
-    let test_tokens = tokenizer.tokenize(test_text);
-    println!(
-        "[DEBUG] Tokenization of '{}' -> {:?}",
-        test_text, test_tokens
-    );
-    for &id in &test_tokens {
-        println!(
-            "[DEBUG]   {} -> '{}'",
-            id,
-            tokenizer.decode_token(id).replace('Ġ', " ")
-        );
-    }
+    // ---- Get BOS and EOS from config dynamically ----
+    let bos_token_id = config.bos_token_id.unwrap_or(151643);
+    let eos_token_id = config.eos_token_id.unwrap_or(151643);
 
     loop {
         print!("\nUser ❯ ");
@@ -658,38 +663,56 @@ fn main() -> Result<()> {
                         &x_seq[i * hidden_size..(i + 1) * hidden_size],
                         &layer.input_layernorm,
                         &mut x_norm,
-                        1e-6,
+                        rms_norm_eps,
                     );
                     let mut q_i = vec![0.0f32; hidden_size];
                     let mut k_i = vec![0.0f32; kv_proj_size];
                     let mut v_i = vec![0.0f32; kv_proj_size];
 
-                    matmul_vec_bias(
-                        &mut q_i,
-                        &layer.q_proj,
-                        &x_norm,
-                        &layer.q_bias,
-                        hidden_size,
-                        hidden_size,
-                    );
-                    matmul_vec_bias(
-                        &mut k_i,
-                        &layer.k_proj,
-                        &x_norm,
-                        &layer.k_bias,
-                        kv_proj_size,
-                        hidden_size,
-                    );
-                    matmul_vec_bias(
-                        &mut v_i,
-                        &layer.v_proj,
-                        &x_norm,
-                        &layer.v_bias,
-                        kv_proj_size,
-                        hidden_size,
-                    );
+                    // Check for biases dynamically
+                    if let Some(bias) = &layer.q_bias {
+                        matmul_vec_bias(
+                            &mut q_i,
+                            &layer.q_proj,
+                            &x_norm,
+                            bias,
+                            hidden_size,
+                            hidden_size,
+                        );
+                    } else {
+                        matmul_vec(&mut q_i, &layer.q_proj, &x_norm, hidden_size, hidden_size);
+                    }
 
-                    apply_rope(&mut q_i, &mut k_i, i, n_q_heads, n_kv_heads, head_dim);
+                    if let Some(bias) = &layer.k_bias {
+                        matmul_vec_bias(
+                            &mut k_i,
+                            &layer.k_proj,
+                            &x_norm,
+                            bias,
+                            kv_proj_size,
+                            hidden_size,
+                        );
+                    } else {
+                        matmul_vec(&mut k_i, &layer.k_proj, &x_norm, kv_proj_size, hidden_size);
+                    }
+
+                    if let Some(bias) = &layer.v_bias {
+                        matmul_vec_bias(
+                            &mut v_i,
+                            &layer.v_proj,
+                            &x_norm,
+                            bias,
+                            kv_proj_size,
+                            hidden_size,
+                        );
+                    } else {
+                        matmul_vec(&mut v_i, &layer.v_proj, &x_norm, kv_proj_size, hidden_size);
+                    }
+
+                    // Apply RoPE with dynamic theta
+                    apply_rope(
+                        &mut q_i, &mut k_i, i, n_q_heads, n_kv_heads, head_dim, rope_theta,
+                    );
 
                     q_seq[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(&q_i);
                     k_seq[i * kv_proj_size..(i + 1) * kv_proj_size].copy_from_slice(&k_i);
@@ -730,7 +753,7 @@ fn main() -> Result<()> {
                         &x_post_attn[i * hidden_size..(i + 1) * hidden_size],
                         &layer.post_attention_layernorm,
                         &mut x_norm,
-                        1e-6,
+                        rms_norm_eps,
                     );
                     let mut gate_i = vec![0.0f32; intermediate_size];
                     let mut up_i = vec![0.0f32; intermediate_size];
@@ -768,7 +791,12 @@ fn main() -> Result<()> {
 
             let last_hidden = &x_seq[(seq_len - 1) * hidden_size..seq_len * hidden_size];
             let mut final_norm = vec![0.0f32; hidden_size];
-            rms_norm(last_hidden, &final_norm_weight, &mut final_norm, 1e-6);
+            rms_norm(
+                last_hidden,
+                &final_norm_weight,
+                &mut final_norm,
+                rms_norm_eps,
+            );
 
             // Compute logits
             let mut logits = vec![0.0f32; vocab_size];
