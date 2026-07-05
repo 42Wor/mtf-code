@@ -1,7 +1,3 @@
 [workspace]
-members = [
-    "mtf-common",
-    "mtf-compiler",
-    "mtf-engine",
-]
+members = ["mtf-common", "mtf-compiler", "mtf-engine"]
 resolver = "2"
