@@ -107,14 +107,9 @@ impl Generator {
                 .model
                 .forward(&input, start_pos, &mut self.llama_cache)?;
 
-            // Extract the 1D logits slice [vocab_size] for the last token in the sequence
-            let seq_len = input.dim(1)?;
-            let logits = if logits.dims().len() == 3 {
-                logits.i((0, seq_len - 1))?
-            } else {
-                logits.i(0)?
-            };
-            let logits = logits.to_dtype(DType::F32)?;
+            // Extract the 1D logits slice [vocab_size] for the last token using the actual logits sequence length
+            let logits_seq_len = logits.dim(1)?;
+            let logits = logits.i((0, logits_seq_len - 1))?.to_dtype(DType::F32)?;
 
             let next_token = self.logits_processor.sample(&logits)?;
             tokens.push(next_token);

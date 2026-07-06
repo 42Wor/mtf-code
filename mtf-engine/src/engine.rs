@@ -15,10 +15,11 @@ pub struct MtfEngine {
     config: serde_json::Value,
 }
 
+#[allow(dead_code)]
 struct TensorEntry {
     offset: u64,
     shape: Vec<usize>,
-    dtype: u8, // 0 = F32
+    dtype: u8,
 }
 
 impl MtfEngine {
