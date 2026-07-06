@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
 use memmap2::Mmap;
 use mtf_common::MAGIC_BYTES;
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ impl MtfEngine {
         let mmap = unsafe { Mmap::map(&file)? };
 
         let mut cursor = Cursor::new(&mmap[..]);
-        let mut magic = [0u8; 4];
+        let mut magic = [0u8; 8]; // Updated to match MAGIC_BYTES (8 bytes)
         cursor.read_exact(&mut magic)?;
         anyhow::ensure!(magic == *MAGIC_BYTES, "Invalid magic bytes");
 
@@ -35,15 +35,15 @@ impl MtfEngine {
         let tensor_count = cursor.read_u64::<LittleEndian>()?;
         cursor.seek(SeekFrom::Current(44))?;
 
-        // Read footer from end
+        // Read footer from the end
         let file_len = mmap.len() as u64;
-        let footer_start = file_len - 4 - 32 - 8 * 3; // 4 magic + 32 reserved + 3 u64s
+        let footer_start = file_len - 64; // Adjusted to match exact 64-byte footer format
         let mut footer_cursor = Cursor::new(&mmap[footer_start as usize..]);
         let index_offset = footer_cursor.read_u64::<LittleEndian>()?;
         let metadata_offset = footer_cursor.read_u64::<LittleEndian>()?;
         let metadata_size = footer_cursor.read_u64::<LittleEndian>()?;
 
-        // metadata block
+        // Extract metadata block
         let meta_bytes =
             &mmap[metadata_offset as usize..metadata_offset as usize + metadata_size as usize];
         let decompressed = zstd::decode_all(meta_bytes)?;
@@ -54,7 +54,7 @@ impl MtfEngine {
             .cloned()
             .unwrap_or(serde_json::json!({}));
 
-        // parse index
+        // Parse tensor index
         let mut tensor_index = HashMap::new();
         let mut idx_cursor = Cursor::new(&mmap[index_offset as usize..]);
         for _ in 0..tensor_count {
@@ -93,14 +93,17 @@ impl MtfEngine {
             .with_context(|| format!("Tensor '{}' not found", name))?;
         let numel: usize = entry.shape.iter().product();
         let byte_offset = entry.offset as usize;
-        let byte_len = numel * 4; // assume f32 (4 bytes)
+        let byte_len = numel * 4; // Assuming f32 (4 bytes)
         let data = &self.mmap[byte_offset..byte_offset + byte_len];
-        // Convert bytes to f32 (little-endian)
+
+        // Convert raw bytes to f32 (little-endian)
         let float_data: Vec<f32> = data
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-        let tensor = Tensor::from_slice(&float_data, &entry.shape, &Device::Cpu)?;
+
+        // Updated to entry.shape.as_slice() to satisfy Shape trait boundary
+        let tensor = Tensor::from_slice(&float_data, entry.shape.as_slice(), &Device::Cpu)?;
         Ok(tensor)
     }
 

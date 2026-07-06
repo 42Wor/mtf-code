@@ -2,9 +2,9 @@ mod engine;
 mod varbuilder;
 
 use anyhow::{Context, Result};
-use candle_core::Device;
+use candle_core::{DType, Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::llama::{Cache, Config, Llama};
+use candle_transformers::models::llama::{Cache, Config, Llama, LlamaConfig};
 use clap::Parser;
 use engine::MtfEngine;
 use std::path::PathBuf;
@@ -104,12 +104,16 @@ fn main() -> Result<()> {
         .as_object()
         .context("Tokenizer not found in metadata")?;
     let tokenizer_str = serde_json::to_string(tokenizer_json)?;
+
+    // Convert tokenizer loading error type before appending anyhow context
     let tokenizer = Tokenizer::from_bytes(tokenizer_str.as_bytes())
+        .map_err(|e| anyhow::anyhow!(e))
         .context("Failed to parse tokenizer from metadata")?;
 
-    // Build model config
+    // Deserialize into LlamaConfig and safely convert into Llama::Config
     let config_json = engine.get_config().clone();
-    let config: Config = serde_json::from_value(config_json)?;
+    let llama_config: LlamaConfig = serde_json::from_value(config_json)?;
+    let config = llama_config.into_config(false); // Disables flash-attention to prevent potential device crashes
 
     let vb = create_mtf_var_builder(&engine, device.clone());
     let model = Llama::load(vb, &config)?;
@@ -119,8 +123,8 @@ fn main() -> Result<()> {
         &config,
         tokenizer,
         device,
-        Some(0.0), // temperature (0.0 = greedy)
-        Some(1.0), // top‑p
+        Some(0.0), // Temperature (0.0 = greedy)
+        Some(1.0), // Top‑p
     )?;
     let generated = gen.generate(&args.prompt, args.max_tokens as u64)?;
 
