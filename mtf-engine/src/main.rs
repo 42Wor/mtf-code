@@ -2,14 +2,17 @@ mod engine;
 mod varbuilder;
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::llama::{Cache, Config, Llama, LlamaConfig};
 use clap::Parser;
 use engine::MtfEngine;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 use varbuilder::create_mtf_var_builder;
+
+// Import the supported model architectures
+use candle_transformers::models::llama::{Cache as LlamaCache, Llama, LlamaConfig};
+use candle_transformers::models::qwen2::{Config as Qwen2Config, ModelForCausalLM as Qwen2};
 
 #[derive(Parser)]
 struct Args {
@@ -19,38 +22,67 @@ struct Args {
     #[arg(short, long)]
     prompt: String,
 
-    #[arg(short, long, default_value = "20")]
+    #[arg(short, long, default_value = "50")]
     max_tokens: usize,
 
     #[arg(long)]
     use_cuda: bool,
 }
 
+/// Unified abstraction for supported model architectures
+pub enum ModelArchitecture {
+    Llama(Llama),
+    Qwen2(Qwen2),
+}
+
+impl ModelArchitecture {
+    /// Dispatches the forward pass to the underlying architecture
+    pub fn forward(
+        &mut self,
+        input: &Tensor,
+        pos: usize,
+        cache: &mut Option<LlamaCache>,
+    ) -> Result<Tensor> {
+        match self {
+            ModelArchitecture::Qwen2(model) => {
+                let logits = model.forward(input, pos)?;
+                Ok(logits)
+            }
+            ModelArchitecture::Llama(model) => {
+                let llama_cache = cache
+                    .as_mut()
+                    .context("Llama requires an active KV Cache state")?;
+                let logits = model.forward(input, pos, llama_cache)?;
+                Ok(logits)
+            }
+        }
+    }
+}
+
 pub struct Generator {
-    model: Llama,
+    model: ModelArchitecture,
     device: Device,
     tokenizer: Tokenizer,
     logits_processor: LogitsProcessor,
-    cache: Cache,
+    llama_cache: Option<LlamaCache>,
 }
 
 impl Generator {
     pub fn new(
-        model: Llama,
-        config: &Config,
+        model: ModelArchitecture,
         tokenizer: Tokenizer,
         device: Device,
+        llama_cache: Option<LlamaCache>,
         temp: Option<f64>,
         top_p: Option<f64>,
     ) -> Result<Self> {
         let logits_processor = LogitsProcessor::new(299792458, temp, top_p);
-        let cache = Cache::new(true, DType::F32, config, &device)?;
         Ok(Self {
             model,
             device,
             tokenizer,
             logits_processor,
-            cache,
+            llama_cache,
         })
     }
 
@@ -70,8 +102,19 @@ impl Generator {
             let ctxt = &tokens[start_pos..];
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
 
-            let logits = self.model.forward(&input, start_pos, &mut self.cache)?;
-            let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
+            // Pass execution to our unified dispatcher
+            let logits = self
+                .model
+                .forward(&input, start_pos, &mut self.llama_cache)?;
+
+            // Extract the 1D logits slice [vocab_size] for the last token in the sequence
+            let seq_len = input.dim(1)?;
+            let logits = if logits.dims().len() == 3 {
+                logits.i((0, seq_len - 1))?
+            } else {
+                logits.i(0)?
+            };
+            let logits = logits.to_dtype(DType::F32)?;
 
             let next_token = self.logits_processor.sample(&logits)?;
             tokens.push(next_token);
@@ -99,36 +142,65 @@ fn main() -> Result<()> {
 
     let engine = MtfEngine::load(&args.model)?;
 
-    // Load tokenizer from metadata
+    // 1. Load Tokenizer
     let tokenizer_json = engine.get_metadata()["tokenizer"]
         .as_object()
         .context("Tokenizer not found in metadata")?;
     let tokenizer_str = serde_json::to_string(tokenizer_json)?;
-
-    // Convert tokenizer loading error type before appending anyhow context
     let tokenizer = Tokenizer::from_bytes(tokenizer_str.as_bytes())
         .map_err(|e| anyhow::anyhow!(e))
-        .context("Failed to parse tokenizer from metadata")?;
+        .context("Failed to parse tokenizer")?;
 
-    // Deserialize into LlamaConfig and safely convert into Llama::Config
+    // 2. Identify Model Type from Config Metadata
     let config_json = engine.get_config().clone();
-    let llama_config: LlamaConfig = serde_json::from_value(config_json)?;
-    let config = llama_config.into_config(false); // Disables flash-attention to prevent potential device crashes
+    let model_type = config_json
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama"); // Fallback to Llama
+
+    log::info!(
+        "Dynamically configuring engine for architecture: {}",
+        model_type
+    );
 
     let vb = create_mtf_var_builder(&engine, device.clone());
-    let model = Llama::load(vb, &config)?;
+    let mut llama_cache = None;
+
+    // 3. Polymorphically instantiate the model based on config type
+    let model = match model_type {
+        "qwen2" => {
+            let config: Qwen2Config = serde_json::from_value(config_json)?;
+            let qwen_model = Qwen2::new(&config, vb)?;
+            ModelArchitecture::Qwen2(qwen_model)
+        }
+        "llama" | _ => {
+            // LlamaConfig is the deserializable configuration struct
+            let config: LlamaConfig = serde_json::from_value(config_json)?;
+            let resolved_config = config.into_config(false); // Disable flash attention for compatibility
+
+            // Llama uses external Cache states (disable flash attention inside the cache state)
+            llama_cache = Some(LlamaCache::new(
+                false,
+                DType::F32,
+                &resolved_config,
+                &device,
+            )?);
+            let llama_model = Llama::load(vb, &resolved_config)?;
+            ModelArchitecture::Llama(llama_model)
+        }
+    };
 
     let mut gen = Generator::new(
         model,
-        &config,
         tokenizer,
         device,
-        Some(0.0), // Temperature (0.0 = greedy)
-        Some(1.0), // Top‑p
+        llama_cache,
+        Some(0.0), // Greedy search
+        Some(1.0),
     )?;
-    let generated = gen.generate(&args.prompt, args.max_tokens as u64)?;
 
-    println!("{}", generated);
+    let generated = gen.generate(&args.prompt, args.max_tokens as u64)?;
+    println!("\nPrompt: {}\nGenerated:\n{}", args.prompt, generated);
 
     Ok(())
 }
