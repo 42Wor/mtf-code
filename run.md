@@ -1,9 +1,11 @@
 
-This guide explains how to download a model, compile it to the custom `.mtf` format, and run inference using the engine.
+# `run.md`
+
+This guide explains how to download a model, compile it to the custom `.mtf` format, and run inference using the engine with performance metrics and custom sampling configurations.
 
 ## Prerequisites
 
-Before starting, ensure you have the required Python dependencies installed for downloading models, and that your Rust toolchain is up to date.
+Before starting, ensure you have the required Python dependencies installed to download Hugging Face models.
 
 ```bash
 # Install Hugging Face Hub library for downloading models
@@ -49,23 +51,58 @@ cargo run --release --bin mtf-compiler -- \
 
 ## Step 3: Run Inference with `mtf-engine`
 
-Once compiled, you can load the `.mtf` file with the `mtf-engine`. The engine automatically extracts the tokenizer and configuration embedded in the file metadata and performs the autoregressive text generation [1.1.2, 4.1.2].
+Once compiled, you can load the `.mtf` file with the `mtf-engine`. The engine automatically extracts the tokenizer and configuration embedded in the file metadata, streams token generation in real time, and measures hardware execution speeds.
 
-Run the following command to generate text:
+### Running with Default Options (Greedy Search, 50 Tokens)
 
 ```bash
 cargo run --release --bin mtf-engine -- \
   --model qwen2-0.5b.mtf \
-  --prompt "Once upon a time, in a land far away," \
-  --max-tokens 50
+  --prompt "Once upon a time, in a land far away,"
 ```
 
-### Options
+### Running with Custom Sampling Options (Creative Search, 100 Tokens)
 
-* `--model` (or `-m`): Path to the compiled `.mtf` model [1.1.2].
-* `--prompt` (or `-p`): The text prompt to feed into the model [1.1.2].
-* `--max-tokens`: The maximum number of tokens to generate (defaults to `20`) [1.1.2].
-* `--use-cuda`: Enable this flag if you have a CUDA-compatible GPU setup (`--use-cuda`) [1.1.2].
+```bash
+cargo run --release --bin mtf-engine -- \
+  --model qwen2-0.5b.mtf \
+  --prompt "Explain quantum computing in one sentence:" \
+  --max-tokens 100 \
+  --temperature 0.7 \
+  --top-p 0.9 \
+  --seed 42
+```
+
+### All CLI Options for `mtf-engine`
+
+* `--model` (or `-m`): Path to the compiled `.mtf` model file.
+* `--prompt` (or `-p`): The text prompt to feed into the model.
+* `--max-tokens` (or `-n`): The maximum number of tokens to generate (defaults to `50`).
+* `--temperature` (or `-t`): Controls the randomness of generation. Set to `0.0` for greedy search (the default), and higher values (e.g., `0.7`) for more creative outputs.
+* `--top-p`: Active during non-greedy sampling (`temp > 0`). Keeps only the top tokens whose cumulative probability exceeds the threshold (defaults to `1.0`).
+* `--seed`: An unsigned 64-bit integer (`u64`) seed used to make non-greedy sampling reproducible.
+* `--use-cuda`: Enable this flag if you have a CUDA-compatible GPU setup and wish to run matrix multiplication on the GPU.
+
+---
+
+## Expected Output Format
+
+The engine now streams the generated text token-by-token and outputs a performance analysis at the end of execution:
+
+```text
+=== Prompt Evaluation ===
+Prompt tokens: 11
+
+=== Generated Output ===
+ there was a man named John. He was a very good man, but he was also very poor...
+
+=== Performance Metrics ===
+Time to First Token (TTFT): 1.84s
+Total Generation Time:     3.24s
+Tokens Generated:          50
+Decode Speed:              35.12 tokens/sec
+Overall Throughput:        15.43 tokens/sec
+```
 
 ---
 
