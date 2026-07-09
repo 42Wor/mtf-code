@@ -41,34 +41,23 @@ struct Args {
     /// Random seed for reproducible generation
     #[arg(long, default_value = "299792458")]
     seed: u64,
+
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 /// Unified abstraction for supported model architectures
 pub enum ModelArchitecture {
-    Llama(Llama),
+    Llama(Llama, LlamaCache),
     Qwen2(Qwen2),
 }
 
 impl ModelArchitecture {
     /// Dispatches the forward pass to the underlying architecture
-    pub fn forward(
-        &mut self,
-        input: &Tensor,
-        pos: usize,
-        cache: &mut Option<LlamaCache>,
-    ) -> Result<Tensor> {
+    pub fn forward(&mut self, input: &Tensor, pos: usize) -> Result<Tensor> {
         match self {
-            ModelArchitecture::Qwen2(model) => {
-                let logits = model.forward(input, pos)?;
-                Ok(logits)
-            }
-            ModelArchitecture::Llama(model) => {
-                let llama_cache = cache
-                    .as_mut()
-                    .context("Llama requires an active KV Cache state")?;
-                let logits = model.forward(input, pos, llama_cache)?;
-                Ok(logits)
-            }
+            ModelArchitecture::Llama(model, cache) => model.forward(input, pos, cache).map_err(Into::into),
+            ModelArchitecture::Qwen2(model) => model.forward(input, pos).map_err(Into::into),
         }
     }
 }
@@ -78,7 +67,6 @@ pub struct Generator {
     device: Device,
     tokenizer: Tokenizer,
     logits_processor: LogitsProcessor,
-    llama_cache: Option<LlamaCache>,
 }
 
 impl Generator {
@@ -86,7 +74,6 @@ impl Generator {
         model: ModelArchitecture,
         tokenizer: Tokenizer,
         device: Device,
-        llama_cache: Option<LlamaCache>,
         temp: Option<f64>,
         top_p: Option<f64>,
         seed: u64,
@@ -97,7 +84,6 @@ impl Generator {
             device,
             tokenizer,
             logits_processor,
-            llama_cache,
         })
     }
 
@@ -127,9 +113,7 @@ impl Generator {
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
 
             // Pass execution to our unified dispatcher
-            let logits = self
-                .model
-                .forward(&input, start_pos, &mut self.llama_cache)?;
+            let logits = self.model.forward(&input, start_pos)?;
 
             // Extract the 1D logits slice [vocab_size] for the last token in the sequence
             let logits_seq_len = logits.dim(1)?;
@@ -179,8 +163,13 @@ impl Generator {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
     let args = Args::parse();
+    let level = match args.verbose {
+        0 => log::LevelFilter::Warn,
+        1 => log::LevelFilter::Info,
+        _ => log::LevelFilter::Debug,
+    };
+    env_logger::Builder::new().filter_level(level).init();
 
     let device = if args.use_cuda {
         Device::cuda_if_available(0)?
@@ -212,7 +201,6 @@ fn main() -> Result<()> {
     );
 
     let vb = create_mtf_var_builder(&engine, device.clone());
-    let mut llama_cache = None;
 
     // 3. Polymorphically instantiate the model based on config type
     let model = match model_type {
@@ -221,28 +209,28 @@ fn main() -> Result<()> {
             let qwen_model = Qwen2::new(&config, vb)?;
             ModelArchitecture::Qwen2(qwen_model)
         }
-        "llama" | _ => {
+        "llama" => {
             // LlamaConfig is the deserializable configuration struct
             let config: LlamaConfig = serde_json::from_value(config_json)?;
             let resolved_config = config.into_config(false); // Disable flash attention for compatibility
 
             // Llama uses external Cache states (disable flash attention inside the cache state)
-            llama_cache = Some(LlamaCache::new(
+            let cache = LlamaCache::new(
                 false,
                 DType::F32,
                 &resolved_config,
                 &device,
-            )?);
+            )?;
             let llama_model = Llama::load(vb, &resolved_config)?;
-            ModelArchitecture::Llama(llama_model)
+            ModelArchitecture::Llama(llama_model, cache)
         }
+        _ => anyhow::bail!("Unsupported model type: {}", model_type),
     };
 
     let mut gen = Generator::new(
         model,
         tokenizer,
         device,
-        llama_cache,
         Some(args.temperature),
         Some(args.top_p),
         args.seed,

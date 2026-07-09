@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use candle_core::{Device, Tensor};
 use memmap2::Mmap;
-use mtf_common::MAGIC_BYTES;
+use mtf_common::{MAGIC_BYTES, MIN_ENGINE_VERSION};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -32,7 +32,13 @@ impl MtfEngine {
         cursor.read_exact(&mut magic)?;
         anyhow::ensure!(magic == *MAGIC_BYTES, "Invalid magic bytes");
 
-        let _version = cursor.read_u32::<LittleEndian>()?;
+        let version = cursor.read_u32::<LittleEndian>()?;
+        anyhow::ensure!(
+            version >= MIN_ENGINE_VERSION,
+            "MTF version {} is too old; engine requires >= {}",
+            version,
+            MIN_ENGINE_VERSION
+        );
         let tensor_count = cursor.read_u64::<LittleEndian>()?;
         cursor.seek(SeekFrom::Current(44))?;
 
@@ -100,8 +106,12 @@ impl MtfEngine {
         // Convert raw bytes to f32 (little-endian)
         let float_data: Vec<f32> = data
             .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect();
+            .map(|chunk| {
+                let bytes: [u8; 4] = chunk.try_into()
+                    .context("Failed to convert chunk to 4-byte array")?;
+                Ok(f32::from_le_bytes(bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Updated to entry.shape.as_slice() to satisfy Shape trait boundary
         let tensor = Tensor::from_slice(&float_data, entry.shape.as_slice(), &Device::Cpu)?;

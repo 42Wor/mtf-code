@@ -30,7 +30,7 @@ The script will download the model files to `test_models/qwen2-0.5b/`.
 
 ## Step 2: Compile the Model to `.mtf` Format
 
-The `mtf-compiler` converts standard Hugging Face Safetensors (which may contain `F16` or `BF16` weights) into the custom `.mtf` format with converted `F32` weights, sorting tensors by their name hashes for $O(\log N)$ binary search lookups [3.1.2, 5.1.2].
+The `mtf-compiler` converts standard Hugging Face Safetensors (which may contain `F16` or `BF16` weights) into the custom `.mtf` format with converted `F32` weights, sorting tensors by their name hashes for O(1) hash map lookups [3.1.2, 5.1.2].
 
 To compile the downloaded model, run:
 

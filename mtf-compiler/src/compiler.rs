@@ -5,13 +5,13 @@ use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use mtf_common::hash::mtf_hash_name;
-use mtf_common::{ALIGNMENT_BOUNDARY, MAGIC_BYTES, MAGIC_FOOTER};
+use mtf_common::{ALIGNMENT_BOUNDARY, FORMAT_VERSION, MAGIC_BYTES, MAGIC_FOOTER};
 use safetensors::SafeTensors;
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::Path;
 
-pub const MTF_VERSION: u32 = 1;
+
 
 pub fn run_compile(input_dir: &Path, output_path: &Path) -> Result<()> {
     let safetensors_path = input_dir.join("model.safetensors");
@@ -115,7 +115,7 @@ pub fn run_compile(input_dir: &Path, output_path: &Path) -> Result<()> {
 
     // Header
     out.write_all(MAGIC_BYTES)?;
-    out.write_u32::<LittleEndian>(MTF_VERSION)?;
+    out.write_u32::<LittleEndian>(FORMAT_VERSION)?;
     out.write_u64::<LittleEndian>(tensors.len() as u64)?;
     out.write_all(&[0u8; 44])?;
 
@@ -153,7 +153,7 @@ pub fn run_compile(input_dir: &Path, output_path: &Path) -> Result<()> {
     out.write_u64::<LittleEndian>(index_offset)?;
     out.write_u64::<LittleEndian>(metadata_offset)?;
     out.write_u64::<LittleEndian>(metadata_size)?;
-    out.write_u32::<LittleEndian>(MTF_VERSION)?;
+    out.write_u32::<LittleEndian>(FORMAT_VERSION)?;
     out.write_all(&[0u8; 28])?;
     out.write_all(MAGIC_FOOTER)?;
 
